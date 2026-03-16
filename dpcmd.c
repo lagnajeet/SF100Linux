@@ -98,6 +98,9 @@ int m_boEnReadQuadIO = 0;
 int m_boEnWriteQuadIO = 0;
 volatile bool g_is_operation_on_going = false;
 bool g_is_operation_successful[16] = { false };
+
+/* Operation progress — updated by SerialFlash bulk transfer loops */
+volatile SF_Progress g_sf_progress = { 0, 0 };
 bool g_bDisplayTimer = true;
 bool isSendFFsequence = false;
 /* only print timing progress info if this many seconds ellapsed

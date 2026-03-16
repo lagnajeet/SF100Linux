@@ -610,15 +610,20 @@ bool threadCompareFileAndChip(int Index)
         result = false;
 
     if (result) {
-        ReadChip(DownloadAddrRange, Index);
+        bool readOk = ReadChip(DownloadAddrRange, Index);
 
-        size_t offset = min(DownloadAddrRange.length, g_ulFileSize); 
-        unsigned int crcFile = CRC32(pBufferforLoadedFile, offset);
-        unsigned int crcChip = CRC32(pBufferForLastReadData[Index], offset);
- 
-        result = (crcChip == crcFile); 
+        if (!readOk || pBufferForLastReadData[Index] == NULL) {
+            /* ReadChip failed (USB error / timeout) — mark as verify failure,
+               do not dereference the NULL/stale buffer */
+            result = false;
+        } else {
+            size_t offset = min(DownloadAddrRange.length, g_ulFileSize);
+            unsigned int crcFile = CRC32(pBufferforLoadedFile, offset);
+            unsigned int crcChip = CRC32(pBufferForLastReadData[Index], offset);
+            result = (crcChip == crcFile);
+        }
     }
- 
+
     g_is_operation_successful[Index] = result;
 
     return result;

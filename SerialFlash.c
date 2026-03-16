@@ -7,6 +7,13 @@
 #include <sys/stat.h>
 
 extern int m_isCanceled;
+extern volatile SF_Progress g_sf_progress;
+
+/* Convenience macro: reset progress counters before a new bulk operation */
+#define SF_PROGRESS_RESET(total_bytes) \
+    do { g_sf_progress.done = 0; g_sf_progress.total = (total_bytes); } while(0)
+#define SF_PROGRESS_ADD(n) \
+    do { g_sf_progress.done += (n); } while(0)
 extern int m_bProtectAfterWritenErase;
 extern int m_boEnReadQuadIO;
 extern int m_boEnWriteQuadIO;
@@ -2045,6 +2052,7 @@ int SerialFlash_batchErase(uintptr_t* vAddrs, size_t AddrSize, int Index)
         rq.Index = NO_RESULT_IN;
     }
     rq.Length = 5;
+    SF_PROGRESS_RESET(AddrSize);
     for (i = 0; i < AddrSize; i++) {
         SerialFlash_waitForWEL(Index);
         if (Chip_Info.ChipSizeInByte > 0x1000000) {
@@ -2064,6 +2072,7 @@ int SerialFlash_batchErase(uintptr_t* vAddrs, size_t AddrSize, int Index)
         OutCtrlRequest(&rq, vInstruction, rq.Length, Index);
 
         SerialFlash_waitForWIP(Index);
+        SF_PROGRESS_ADD(1);
     }
     SerialFlash_Enable4ByteAddrMode(false, Index);
     if (!SerialFlash_EndofOperation(Index))
@@ -2100,6 +2109,7 @@ int SerialFlash_rangeErase(unsigned char cmd, size_t sectionSize, struct CAddres
 
     size_t sectorNum = (AddrRange->end - AddrRange->start + sectionSize - 1) / sectionSize;
     size_t i;
+    SF_PROGRESS_RESET(sectorNum);
     for (i = 0; i < sectorNum; ++i) {
         SerialFlash_waitForWEL(Index);
 
@@ -2126,6 +2136,7 @@ int SerialFlash_rangeErase(unsigned char cmd, size_t sectionSize, struct CAddres
             return false;
 
         SerialFlash_waitForWIP(Index);
+        SF_PROGRESS_ADD(1);
     }
     SerialFlash_Enable4ByteAddrMode(false, Index);
 
@@ -2307,6 +2318,7 @@ int SerialFlash_bulkPipeProgram(struct CAddressRange* AddrRange, unsigned char* 
         return false;
 	
 
+    SF_PROGRESS_RESET(AddrRange->end - AddrRange->start);
     if ((AddrRange->end / 0x1000000) > (AddrRange->start / 0x1000000))   
     {
         struct CAddressRange down_range;
@@ -2335,6 +2347,7 @@ int SerialFlash_bulkPipeProgram(struct CAddressRange* AddrRange, unsigned char* 
             FlashCommand_SendCommand_SetupPacketForBulkWrite(&down_range, modeWrite, WriteCom, Chip_Info.PageSizeInByte, Chip_Info.AddrWidth, Index);
             for (i = 0; i < packageNum; ++i) {
                 BulkPipeWrite((unsigned char*)(itr_begin + (i << divider)), 1 << divider, USB_TIMEOUT, Index);
+                SF_PROGRESS_ADD(1 << divider);
                 if (m_isCanceled)
                     return false;
             }
@@ -2345,6 +2358,7 @@ int SerialFlash_bulkPipeProgram(struct CAddressRange* AddrRange, unsigned char* 
         FlashCommand_SendCommand_SetupPacketForBulkWrite(AddrRange, modeWrite, WriteCom, 1 << divider, Chip_Info.AddrWidth, Index);
         for (i = 0; i < packageNum; ++i) { 
             BulkPipeWrite((unsigned char*)((itr_begin + (i << divider))), 1 << divider, USB_TIMEOUT, Index);
+            SF_PROGRESS_ADD(1 << divider);
             if (m_isCanceled)
                 return false;
         }
@@ -2405,6 +2419,7 @@ int SerialFlash_bulkPipeProgram_Micron_4Die(struct CAddressRange* AddrRange, uns
         size_t packageNum;
         size_t loop = (range_temp.end - range_temp.start) / 0x1000000; 
 
+        SF_PROGRESS_RESET(AddrRange->end - AddrRange->start);
         for (j = 0; j < loop; j++) {
             if (j == (loop - 1))
                 down_range.end = AddrRange->end;
@@ -2442,6 +2457,7 @@ int SerialFlash_bulkPipeProgram_Micron_4Die(struct CAddressRange* AddrRange, uns
         FlashCommand_SendCommand_SetupPacketForBulkWrite(&down_range, modeWrite, WriteCom, Chip_Info.PageSizeInByte, Chip_Info.AddrWidth, Index);
         for (i = 0; i < packageNum; ++i) {
        	    BulkPipeWrite((unsigned char*)(itr_begin + (i << divider)), 1 << divider, USB_TIMEOUT, Index);
+            SF_PROGRESS_ADD(1 << divider);
             if (m_isCanceled)
                 return false;
             }
@@ -2469,10 +2485,12 @@ int SerialFlash_bulkPipeProgram_Micron_4Die(struct CAddressRange* AddrRange, uns
 	down_range.end=AddrRange->end-(0x1000000*EAR);
 	down_range.start=AddrRange->start-(0x1000000*EAR); 
 
+        SF_PROGRESS_RESET(down_range.end - down_range.start);
         size_t packageNum = (down_range.end - down_range.start) >> divider;
         FlashCommand_SendCommand_SetupPacketForBulkWrite(&down_range, modeWrite, WriteCom, Chip_Info.PageSizeInByte, Chip_Info.AddrWidth, Index);
         for (i = 0; i < packageNum; ++i) { 
             BulkPipeWrite((unsigned char*)((itr_begin + (i << divider))), 1 << divider, USB_TIMEOUT, Index);
+            SF_PROGRESS_ADD(1 << divider);
             if (m_isCanceled)
                 return false;
         }
@@ -2539,6 +2557,7 @@ int SerialFlash_bulkPipeProgram_twoDie(struct CAddressRange* AddrRange, unsigned
         size_t packageNum;
         size_t loop = (range_temp.end - range_temp.start) / 0x1000000; 
 
+        SF_PROGRESS_RESET(AddrRange->end - AddrRange->start);
         for (j = 0; j < loop; j++) 
 	{
             if (j == (loop - 1))
@@ -2577,6 +2596,7 @@ int SerialFlash_bulkPipeProgram_twoDie(struct CAddressRange* AddrRange, unsigned
             FlashCommand_SendCommand_SetupPacketForBulkWrite(&down_range_die2, modeWrite, WriteCom, Chip_Info.PageSizeInByte,Chip_Info.AddrWidth, Index);
             for (i = 0; i < packageNum; ++i) {
                 BulkPipeWrite((unsigned char*)(itr_begin + (i << divider)), 1 << divider, USB_TIMEOUT, Index);
+                SF_PROGRESS_ADD(1 << divider);
                 if (m_isCanceled)
                     return false;
             }
@@ -2599,9 +2619,11 @@ int SerialFlash_bulkPipeProgram_twoDie(struct CAddressRange* AddrRange, unsigned
 	}
 
         size_t packageNum = (AddrRange->end - AddrRange->start) >> divider;
+        SF_PROGRESS_RESET(AddrRange->end - AddrRange->start);
         FlashCommand_SendCommand_SetupPacketForBulkWrite(&down_range_die2, modeWrite, WriteCom, Chip_Info.PageSizeInByte, Chip_Info.AddrWidth, Index);
         for (i = 0; i < packageNum; ++i) { 
             BulkPipeWrite((unsigned char*)((itr_begin + (i << divider))), 1 << divider, USB_TIMEOUT, Index);
+            SF_PROGRESS_ADD(1 << divider);
             if (m_isCanceled)
                 return false;
         }
@@ -2637,6 +2659,8 @@ int SerialFlash_bulkPipeRead(struct CAddressRange* AddrRange, unsigned char* vDa
     if (AddrRange->length <= 0)
         return false;
  
+    SF_PROGRESS_RESET(AddrRange->length);
+
     if ((AddrRange->end / 0x1000000) > (AddrRange->start / 0x1000000)) //(AddrRange.end>0x1000000 && AddrRange.start<0x1000000)
     { 
         struct CAddressRange read_range;
@@ -2685,7 +2709,7 @@ int SerialFlash_bulkPipeRead(struct CAddressRange* AddrRange, unsigned char* vDa
                 ret = BulkPipeRead(vData + (BufferLocation + i) * (1<<9), USB_TIMEOUT, Index); 
                 if ((ret != (1<<9)) || m_isCanceled)
                     return 0;
-                //memcpy(vData + (BufferLocation+i)*512, v, 512);
+                SF_PROGRESS_ADD(1<<9);
             }
             BufferLocation += pageNum;
         }
@@ -2711,11 +2735,11 @@ int SerialFlash_bulkPipeRead(struct CAddressRange* AddrRange, unsigned char* vDa
         pageNum = AddrRange->length >> 9;
         FlashCommand_SendCommand_SetupPacketForBulkRead(AddrRange, modeRead, ReadCom,Chip_Info.AddrWidth,Chip_Info.ReadDummyLen, Index);
         for (i = 0; i < pageNum; ++i) {
-            ret = BulkPipeRead(vData + i * ret, USB_TIMEOUT, Index);
+            ret = BulkPipeRead(vData + i * 512, USB_TIMEOUT, Index);
             if ((ret != 512) || m_isCanceled) { 
                 return false;
             }
-            //memcpy(vData + i*ret, v, ret);
+            SF_PROGRESS_ADD(512);
         }
     }
     if (SerialFlash_EnableQuadIO(false, m_boEnReadQuadIO, Index) == SerialFlash_FALSE)
@@ -2765,6 +2789,7 @@ int SerialFlash_bulkPipeRead_Micron_4die(struct CAddressRange* AddrRange, unsign
         read_range.end = AddrRange->end;
         loop = (range_temp.end - range_temp.start) / 0x1000000;
 
+        SF_PROGRESS_RESET(AddrRange->length);
         for (j = 0; j < loop; j++) {
                
 
@@ -2803,7 +2828,7 @@ int SerialFlash_bulkPipeRead_Micron_4die(struct CAddressRange* AddrRange, unsign
                 ret = BulkPipeRead(vData + (BufferLocation + i) * (1<<9), USB_TIMEOUT, Index); 
                 if ((ret != (1<<9)) || m_isCanceled)
                     return 0;
-                //memcpy(vData + (BufferLocation+i)*512, v, 512);
+                SF_PROGRESS_ADD(1<<9);
             }
             BufferLocation += pageNum;
         }
@@ -2814,7 +2839,7 @@ int SerialFlash_bulkPipeRead_Micron_4die(struct CAddressRange* AddrRange, unsign
 	     
         timeout = 3;
         re = 0;
-	EAR = (read_range.start & 0xFF000000)>>24;
+	EAR = (AddrRange->start & 0xFF000000)>>24; /* fix: read_range was uninitialized here */
 	if((EAR != preEAR)&&(EAR)) {
 	    do{
 	    	CN25Qxxx_Large_4Die_WREAR(EAR,Index);
@@ -2829,15 +2854,17 @@ int SerialFlash_bulkPipeRead_Micron_4die(struct CAddressRange* AddrRange, unsign
 	    	
           
 	read_range.end=AddrRange->end-(0x1000000*EAR);
-	read_range.start=AddrRange->start-(0x1000000*EAR); 
+	read_range.start=AddrRange->start-(0x1000000*EAR);
+	read_range.length=read_range.end-read_range.start; /* fix: was never set */
+        SF_PROGRESS_RESET(read_range.length);
         pageNum = read_range.length >> 9;
         FlashCommand_SendCommand_SetupPacketForBulkRead(&read_range, modeRead, ReadCom,Chip_Info.AddrWidth,Chip_Info.ReadDummyLen, Index);
         for (i = 0; i < pageNum; ++i) {
-            ret = BulkPipeRead(vData + i * ret, USB_TIMEOUT, Index);
+            ret = BulkPipeRead(vData + i * 512, USB_TIMEOUT, Index); /* fix: was i*ret (ret=0 on first iter) */
             if ((ret != 512) || m_isCanceled) { 
                 return false;
             }
-            //memcpy(vData + i*ret, v, ret);
+            SF_PROGRESS_ADD(512);
         }
     }
     if (SerialFlash_EnableQuadIO(false, m_boEnReadQuadIO, Index) == SerialFlash_FALSE)
@@ -2878,6 +2905,7 @@ int SerialFlash_bulkPipeRead_twoDie(struct CAddressRange* AddrRange, unsigned ch
  
         loop = (range_temp.end - range_temp.start) / 0x1000000;
 
+        SF_PROGRESS_RESET(AddrRange->length);
         for (j = 0; j < loop; j++) { 
             if (j == (loop - 1))
                 read_range.end = AddrRange->end;
@@ -2914,7 +2942,7 @@ int SerialFlash_bulkPipeRead_twoDie(struct CAddressRange* AddrRange, unsigned ch
                 ret = BulkPipeRead(vData + (BufferLocation + i) * 512, USB_TIMEOUT, Index);
                 if ((ret != 512) || m_isCanceled)
                     return 0;
-                //memcpy(vData + (BufferLocation+i)*512, v, 512);
+                SF_PROGRESS_ADD(512);
             }
             BufferLocation += pageNum;
         }
@@ -2936,16 +2964,16 @@ int SerialFlash_bulkPipeRead_twoDie(struct CAddressRange* AddrRange, unsigned ch
 	}
  
         pageNum = range_die2.length >> 9; 
-        
+        SF_PROGRESS_RESET(range_die2.length);
         FlashCommand_SendCommand_SetupPacketForBulkRead(&range_die2, modeRead, ReadCom,Chip_Info.AddrWidth,Chip_Info.ReadDummyLen, Index);
         for (i = 0; i < pageNum; ++i) 
  	{
-            ret = BulkPipeRead(vData + i * ret, USB_TIMEOUT, Index);
+            ret = BulkPipeRead(vData + i * 512, USB_TIMEOUT, Index); /* fix: was i*ret (ret=0 on first iter) */
             if ((ret != 512) || m_isCanceled) 
 	    { 
                 return false;
             }
-            //memcpy(vData + i*ret, v, ret);
+            SF_PROGRESS_ADD(512);
         }
     }
     if (SerialFlash_EnableQuadIO(false, m_boEnReadQuadIO, Index) == SerialFlash_FALSE)

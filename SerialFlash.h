@@ -108,4 +108,21 @@ size_t GetPageSize(void);
 bool SerialFlash_StartofOperation(int Index);
 bool SerialFlash_EndofOperation(int Index);
 
+/* ---------------------------------------------------------------------------
+ * Operation progress tracking
+ * g_sf_progress is updated from the worker thread as bytes are transferred.
+ * Poll it from a GUI timer (e.g. every 100ms) to drive a real progress bar.
+ *   progress% = (double)g_sf_progress.done / g_sf_progress.total * 100
+ * Both fields are reset to 0 at the start of each bulk operation.
+ * For chip-erase (single-shot WIP poll, no byte loop) total stays 0 —
+ * the GUI should fall back to marquee animation when total==0.
+ * --------------------------------------------------------------------------- */
+typedef struct {
+    volatile size_t done;   /* bytes transferred so far            */
+    volatile size_t total;  /* total bytes this operation will move */
+} SF_Progress;
+
+extern volatile SF_Progress g_sf_progress;
+
+
 #endif //SERIALFLASHS

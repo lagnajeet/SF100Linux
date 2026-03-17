@@ -22,6 +22,8 @@
 #include <FL/Fl_Group.H>
 #include <FL/Fl_Check_Button.H>
 #include <FL/Fl_Select_Browser.H>
+#include <FL/Fl_Hold_Browser.H>
+#include <FL/Fl_Round_Button.H>
 #include <FL/Fl_Progress.H>
 #include <FL/fl_ask.H>
 #include <FL/fl_draw.H>
@@ -100,6 +102,7 @@ extern "C" {
     extern unsigned int   g_uiAddr;
     extern size_t         g_uiLen;
     extern unsigned long  g_ulFileSize;
+    extern unsigned int   g_ucFill;
     extern bool           g_bDisplayTimer;
     extern volatile bool  g_is_operation_on_going;
 
@@ -117,6 +120,11 @@ extern "C" {
     unsigned int ReadUID(int Index);
     bool         LoadFile(char* filename);
     void         SaveProgContextChanges(void);
+    bool         HexFileToBin(const char* path, unsigned char* buf, unsigned long* size, unsigned char fill);
+    bool         S19FileToBin(const char* path, unsigned char* buf, unsigned long* size, unsigned char fill);
+    int          ReadBINFile(const char* path, unsigned char* buf, unsigned long* size);
+#include "IntelHexFile.h"
+#include "MotorolaFile.h"
 }
 
 // ── Colours ───────────────────────────────────────────────────────────────────
@@ -124,6 +132,441 @@ extern "C" {
 #define COL_PANEL_HDR fl_rgb_color(0xD0,0xDF,0xF0)
 #define COL_PANEL_BG  fl_rgb_color(0xF6,0xF8,0xFC)
 #define COL_BLUE_VAL  fl_rgb_color(0x00,0x55,0xBB)
+
+// ── Chip DB parser ────────────────────────────────────────────────────────────
+// Parses ChipInfoDb.dedicfg (XML, UTF-16LE with CRLF line endings) and returns
+// a flat list of {TypeName, Manufacturer} for every SPI NOR chip entry.
+struct ChipEntry { std::string name, manufacturer; };
+
+static std::vector<ChipEntry> parse_chip_db() {
+    std::vector<ChipEntry> chips;
+    FILE* fp = openChipInfoDb();
+    if (!fp) return chips;
+
+    // File is UTF-16LE. Read entire file then extract ASCII chars (strip nulls).
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    std::vector<char> raw(sz+1, 0);
+    fread(raw.data(), 1, sz, fp);
+    fclose(fp);
+
+    // Strip null bytes to get ASCII-compatible text
+    std::string text;
+    text.reserve(sz);
+    for (long i = 0; i < sz; i++)
+        if (raw[i] != '\0') text += raw[i];
+
+    // Walk through <Chip ...> blocks extracting TypeName and Manufacturer
+    size_t pos = 0;
+    while ((pos = text.find("<Chip ", pos)) != std::string::npos) {
+        // Find end of this chip element (ends at "/>")
+        size_t end = text.find("/>", pos);
+        if (end == std::string::npos) break;
+        std::string block = text.substr(pos, end - pos + 2);
+        pos = end + 2;
+
+        // Helper: extract attribute value from block
+        auto attr = [&](const std::string& key) -> std::string {
+            std::string pat = key + "=\"";
+            size_t a = block.find(pat);
+            if (a == std::string::npos) return "";
+            a += pat.size();
+            size_t b = block.find('"', a);
+            if (b == std::string::npos) return "";
+            return block.substr(a, b - a);
+        };
+
+        // Only include SPI NOR chips (same filter as Windows dialog "SPI NOR" type)
+        std::string ictype = attr("ICType");
+        if (ictype != "SPI_NOR") continue;
+
+        std::string name = attr("TypeName");
+        std::string mfr  = attr("Manufacturer");
+        if (name.empty()) continue;
+        chips.push_back({name, mfr});
+    }
+    return chips;
+}
+
+// ── Chip Select Dialog ────────────────────────────────────────────────────────
+// Mirrors the Windows "Manually Select Memory Type" dialog.
+// auto_detected: list of chip names the programmer identified (highlighted).
+// Returns chosen TypeName, or "" if cancelled.
+static std::string show_chip_select_dialog(
+        const std::vector<std::string>& auto_detected,
+        const std::vector<ChipEntry>&   all_chips)
+{
+    // Build sorted unique manufacturer list
+    std::vector<std::string> mfrs;
+    for (auto& c : all_chips) {
+        if (c.manufacturer.empty()) continue;
+        if (std::find(mfrs.begin(), mfrs.end(), c.manufacturer) == mfrs.end())
+            mfrs.push_back(c.manufacturer);
+    }
+    std::sort(mfrs.begin(), mfrs.end());
+
+    // Result: empty = cancelled
+    static std::string s_result;
+    s_result = "";
+
+    const int DW = 640, DH = 500;
+    const int PAD = 10;
+    // Left panel: chip type + manufacturer filter
+    const int LW = 210, RW = DW - LW - PAD*3;
+    const int LIST_H = DH - 120;
+
+    Fl_Window* dlg = new Fl_Window(DW, DH, "Manually Select Memory Type");
+    dlg->begin();
+
+    // Chip Type label + dropdown (only SPI NOR supported)
+    int y = PAD;
+    new Fl_Box(PAD, y+3, 80, 22, "Chip Type:");
+    Fl_Choice* cho_type = new Fl_Choice(PAD+85, y, 130, 24);
+    cho_type->add("SPI NOR");
+    cho_type->value(0);
+    cho_type->deactivate(); // only SPI NOR supported
+    y += 32;
+
+    // Filters label
+    new Fl_Box(PAD,               y, LW,  18, "Filters:");
+    new Fl_Box(PAD*2+LW,          y, RW,  18, "Memory List:");
+    ((Fl_Box*)Fl::focus()? Fl::focus() : dlg)->labelsize(11); // style both
+    y += 20;
+
+    // Manufacturer browser (left)
+    Fl_Hold_Browser* lst_mfr = new Fl_Hold_Browser(PAD, y, LW, LIST_H);
+    lst_mfr->textsize(12);
+
+    // Chip name browser (right)
+    Fl_Hold_Browser* lst_chip = new Fl_Hold_Browser(PAD*2+LW, y, RW, LIST_H);
+    lst_chip->textsize(12);
+
+    // Populate manufacturer list
+    lst_mfr->add("<All>");
+    lst_mfr->add("<Auto Detected Type(s)>");
+    for (auto& m : mfrs) lst_mfr->add(m.c_str());
+
+    // Populate chip list function (captures by pointer)
+    struct State {
+        Fl_Hold_Browser* lst_mfr;
+        Fl_Hold_Browser* lst_chip;
+        const std::vector<ChipEntry>* all;
+        const std::vector<std::string>* auto_det;
+        std::string* result;
+        Fl_Window* dlg;
+
+        void populate_chips(int mfr_sel) {
+            lst_chip->clear();
+            std::string filter = (mfr_sel >= 1) ? lst_mfr->text(mfr_sel) : "<All>";
+            bool show_all      = (filter == "<All>");
+            bool auto_det_mode = (filter == "<Auto Detected Type(s)>");
+
+            // Collect matching names, then sort before adding to browser
+            std::vector<std::string> entries;
+            for (auto& c : *all) {
+                bool include = show_all
+                    || (auto_det_mode && std::find(auto_det->begin(), auto_det->end(), c.name) != auto_det->end())
+                    || (!auto_det_mode && !show_all && c.manufacturer == filter);
+                if (include) entries.push_back(c.name);
+            }
+            std::sort(entries.begin(), entries.end());
+
+            int first_auto = -1;
+            int idx = 1;
+            for (auto& name : entries) {
+                bool is_auto = std::find(auto_det->begin(), auto_det->end(), name) != auto_det->end();
+                std::string entry = is_auto ? ("@b" + name) : name;
+                lst_chip->add(entry.c_str());
+                if (is_auto && first_auto < 0) first_auto = idx;
+                idx++;
+            }
+            // Select and scroll to first auto-detected chip
+            if (first_auto > 0) {
+                lst_chip->value(first_auto);
+                lst_chip->middleline(first_auto);
+            } else if (lst_chip->size() > 0) {
+                lst_chip->value(1);
+            }
+        }
+    } state;
+    state.lst_mfr  = lst_mfr;
+    state.lst_chip = lst_chip;
+    state.all      = &all_chips;
+    state.auto_det = &auto_detected;
+    state.result   = &s_result;
+    state.dlg      = dlg;
+
+    // Start with <Auto Detected Type(s)> selected if we have matches, else <All>
+    if (!auto_detected.empty()) {
+        lst_mfr->value(2); // "<Auto Detected Type(s)>"
+        state.populate_chips(2);
+    } else {
+        lst_mfr->value(1); // "<All>"
+        state.populate_chips(1);
+    }
+
+    // Manufacturer selection callback
+    lst_mfr->callback([](Fl_Widget*, void* ud){
+        State* s = (State*)ud;
+        s->populate_chips(s->lst_mfr->value());
+    }, &state);
+
+    // Chip double-click = OK
+    lst_chip->callback([](Fl_Widget*, void* ud){
+        if (Fl::event_clicks() >= 1) {
+            State* s = (State*)ud;
+            int v = s->lst_chip->value();
+            if (v > 0) {
+                std::string raw = s->lst_chip->text(v);
+                // strip @b prefix if present
+                if (raw.size() > 2 && raw[0]=='@' && raw[1]=='b') raw = raw.substr(2);
+                *s->result = raw;
+                s->dlg->hide();
+            }
+        }
+    }, &state);
+
+    // OK / Cancel buttons
+    y += LIST_H + PAD;
+    Fl_Button* btn_ok  = new Fl_Button(DW-180, y, 80, 26, "OK");
+    Fl_Button* btn_can = new Fl_Button(DW-90,  y, 80, 26, "Cancel");
+
+    btn_ok->callback([](Fl_Widget*, void* ud){
+        State* s = (State*)ud;
+        int v = s->lst_chip->value();
+        if (v > 0) {
+            std::string raw = s->lst_chip->text(v);
+            if (raw.size() > 2 && raw[0]=='@' && raw[1]=='b') raw = raw.substr(2);
+            *s->result = raw;
+        }
+        s->dlg->hide();
+    }, &state);
+
+    btn_can->callback([](Fl_Widget*, void* ud){
+        ((State*)ud)->dlg->hide();
+    }, &state);
+
+    dlg->callback([](Fl_Widget* w, void*){ w->hide(); });
+
+    dlg->end();
+    dlg->set_modal();
+    dlg->show();
+    while (dlg->shown()) Fl::wait();
+    delete dlg;
+
+    return s_result;
+}
+
+// Forward declaration (defined later with native file picker)
+static std::string native_pick(const char* title, const char* glob, bool save);
+
+// ── Recent files ──────────────────────────────────────────────────────────────
+static const int RECENT_MAX = 10;
+static std::vector<std::string> g_recent_files;
+static const char* RECENT_PATH = nullptr; // set at startup
+
+static std::string recent_file_path() {
+    const char* home = getenv("HOME");
+    static std::string p;
+    if (home) p = std::string(home) + "/.config/dpgui_recent";
+    else p = "/tmp/dpgui_recent";
+    return p;
+}
+
+static void recent_load() {
+    g_recent_files.clear();
+    FILE* f = fopen(recent_file_path().c_str(), "r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1]=='\n'||line[len-1]=='\r')) line[--len]=0;
+        if (len > 0) g_recent_files.push_back(line);
+    }
+    fclose(f);
+}
+
+static void recent_add(const std::string& path) {
+    // Remove duplicate then prepend
+    g_recent_files.erase(
+        std::remove(g_recent_files.begin(), g_recent_files.end(), path),
+        g_recent_files.end());
+    g_recent_files.insert(g_recent_files.begin(), path);
+    if ((int)g_recent_files.size() > RECENT_MAX)
+        g_recent_files.resize(RECENT_MAX);
+    FILE* f = fopen(recent_file_path().c_str(), "w");
+    if (!f) return;
+    for (auto& p : g_recent_files) fprintf(f, "%s\n", p.c_str());
+    fclose(f);
+}
+
+// ── File format ───────────────────────────────────────────────────────────────
+enum FileFormat { FMT_AUTO=0, FMT_BIN, FMT_HEX, FMT_S19 };
+static FileFormat g_file_format = FMT_AUTO;
+static bool       g_truncate    = false;
+
+// Load file using explicit format choice (bypasses extension detection)
+static bool load_file_with_format(const char* path, FileFormat fmt) {
+    unsigned long size = 0;
+    bool ok = false;
+    // pBufferforLoadedFile is allocated inside project.c — we go through LoadFile
+    // but we can't override format there. Workaround: temporarily rename to a
+    // path with the right extension using a symlink in /tmp.
+    if (fmt == FMT_AUTO) {
+        char buf[4096]; strncpy(buf, path, sizeof(buf)-1);
+        return LoadFile(buf);
+    }
+    // Build a temp symlink with the right extension
+    const char* ext = (fmt==FMT_HEX) ? ".hex" : (fmt==FMT_S19) ? ".s19" : ".bin";
+    char lnk[256];
+    snprintf(lnk, sizeof(lnk), "/tmp/dpgui_fmt_override%s", ext);
+    unlink(lnk);
+    if (symlink(path, lnk) == 0) {
+        ok = LoadFile(lnk);
+        unlink(lnk);
+    } else {
+        // symlink failed (e.g. cross-device) — fall back
+        char buf[4096]; strncpy(buf, path, sizeof(buf)-1);
+        ok = LoadFile(buf);
+    }
+    return ok;
+}
+
+// ── Load File dialog ──────────────────────────────────────────────────────────
+// Returns true if user confirmed, populates out_path, out_fmt, out_truncate.
+static bool show_load_file_dialog(std::string& out_path,
+                                   FileFormat&   out_fmt,
+                                   bool&         out_truncate,
+                                   size_t        chip_size_bytes)
+{
+    static bool       s_ok       = false;
+    static FileFormat s_fmt      = FMT_AUTO;
+    static bool       s_trunc    = false;
+    static std::string s_path;
+
+    s_ok    = false;
+    s_fmt   = g_file_format;
+    s_trunc = g_truncate;
+    s_path  = out_path;  // pre-fill with current path
+
+    const int DW=560, DH=150, PAD=12;
+
+    Fl_Window* dlg = new Fl_Window(DW, DH, "Load File");
+    dlg->begin();
+
+    int y = PAD;
+    // File path label + combo (recent files)
+    new Fl_Box(PAD, y+3, 72, 22, "File Path:");
+    Fl_Choice* cho_path = new Fl_Choice(PAD+76, y, DW-PAD-76-80-PAD, 26);
+    cho_path->textsize(11);
+    // Populate with recent files
+    for (auto& r : g_recent_files) cho_path->add(r.c_str());
+    if (!s_path.empty()) {
+        // If current path isn't in list add it temporarily at top
+        bool found = false;
+        for (int i = 0; i < cho_path->size()-1; i++)
+            if (std::string(cho_path->text(i)) == s_path) { cho_path->value(i); found=true; break; }
+        if (!found) { cho_path->insert(0, s_path.c_str(), 0, nullptr); cho_path->value(0); }
+    } else if (cho_path->size() > 1) {
+        cho_path->value(0);
+    }
+
+    Fl_Button* btn_find = new Fl_Button(DW-PAD-76, y, 76, 26, "Find");
+    btn_find->callback([](Fl_Widget*, void* ud){
+        Fl_Choice* c = (Fl_Choice*)ud;
+        std::string p = native_pick("Select File",
+            "*.bin *.hex *.img *.s19 *.srec *.mot *.rom", false);
+        if (!p.empty()) {
+            bool found = false;
+            for (int i = 0; i < c->size()-1; i++)
+                if (std::string(c->text(i)) == p) { c->value(i); found=true; break; }
+            if (!found) { c->insert(0, p.c_str(), 0, nullptr); c->value(0); }
+            c->redraw();
+        }
+    }, cho_path);
+    y += 34;
+
+    // Data Format radios
+    new Fl_Box(PAD, y+3, 86, 22, "Data Format:");
+    static Fl_Round_Button* rb[4];
+    const char* fmtlabels[] = {"Raw Binary","Intel Hex","Motorola S19","ROM"};
+    int rx = PAD+90;
+    for (int i = 0; i < 4; i++) {
+        rb[i] = new Fl_Round_Button(rx, y, 120, 22, fmtlabels[i]);
+        rb[i]->type(FL_RADIO_BUTTON);
+        rb[i]->labelsize(12);
+        rx += 120;
+    }
+    // ROM is same as BIN for our purposes
+    rb[3]->deactivate();
+    // Set initial selection
+    int sel = (int)s_fmt; // 0=AUTO→Raw Binary, 1=BIN, 2=HEX, 3=S19
+    rb[sel == 0 ? 0 : sel-1]->value(1); // AUTO→Raw Binary selected by default
+    y += 30;
+
+    // Truncate checkbox
+    Fl_Check_Button* chk_trunc = new Fl_Check_Button(PAD, y,
+        DW-PAD*2, 22, "Truncate file to fit in the target area.");
+    chk_trunc->labelsize(12);
+    chk_trunc->value(s_trunc ? 1 : 0);
+    if (chip_size_bytes == 0) chk_trunc->deactivate(); // no chip selected yet
+    y += 30;
+
+    // Separator line
+    y += 4;
+    // OK / Cancel
+    Fl_Button* btn_ok  = new Fl_Button(DW-190, y, 80, 26, "OK");
+    Fl_Button* btn_can = new Fl_Button(DW-100, y, 80, 26, "Cancel");
+
+    struct DlgState {
+        Fl_Window*     dlg;
+        Fl_Choice*     cho_path;
+        Fl_Round_Button** rb;
+        Fl_Check_Button* chk_trunc;
+        bool*          ok;
+        FileFormat*    fmt;
+        bool*          trunc;
+        std::string*   path;
+    } ds { dlg, cho_path, rb, chk_trunc, &s_ok, &s_fmt, &s_trunc, &s_path };
+
+    btn_ok->callback([](Fl_Widget*, void* ud){
+        DlgState* d = (DlgState*)ud;
+        int v = d->cho_path->value();
+        if (v >= 0 && d->cho_path->text(v))
+            *d->path = d->cho_path->text(v);
+        // Determine format from radio buttons
+        if      (d->rb[1]->value()) *d->fmt = FMT_HEX;
+        else if (d->rb[2]->value()) *d->fmt = FMT_S19;
+        else                         *d->fmt = FMT_BIN;
+        *d->trunc = (d->chk_trunc->value() != 0);
+        *d->ok    = !d->path->empty();
+        d->dlg->hide();
+    }, &ds);
+
+    btn_can->callback([](Fl_Widget*, void* ud){
+        ((DlgState*)ud)->dlg->hide();
+    }, &ds);
+
+    dlg->callback([](Fl_Widget* w, void*){ w->hide(); });
+
+    dlg->end();
+    dlg->set_modal();
+    dlg->show();
+    while (dlg->shown()) Fl::wait();
+    delete dlg;
+
+    if (s_ok) {
+        out_path     = s_path;
+        out_fmt      = s_fmt;
+        out_truncate = s_trunc;
+        // Persist choices
+        g_file_format = s_fmt;
+        g_truncate    = s_trunc;
+        recent_add(s_path);
+    }
+    return s_ok;
+}
 
 // ── stdout capture ────────────────────────────────────────────────────────────
 static int g_pipe_rd=-1, g_pipe_wr=-1, g_saved_stdout=-1;
@@ -198,7 +641,7 @@ static std::string native_pick(const char* title, const char* glob, bool save=fa
 
 // ── InfoPanel ─────────────────────────────────────────────────────────────────
 class InfoPanel : public Fl_Group {
-    static const int HDR_H=20, ROW_H=19, PAD=4;
+    static const int HDR_H=20, ROW_H=19, PAD=2;
 public:
     InfoPanel(int x,int y,int w,int h,const char* title) : Fl_Group(x,y,w,h) {
         box(FL_BORDER_BOX); color(COL_PANEL_BG);
@@ -213,7 +656,7 @@ public:
         int cw  = (w()-PAD*2)/total_cols;
         int cx  = x()+PAD + col*cw;
         int cy  = y()+HDR_H+PAD + row*ROW_H;
-        int lw  = 82;
+        int lw  = 66;
         Fl_Box* lb=new Fl_Box(cx,cy,lw,ROW_H-2,lbl);
         lb->align(FL_ALIGN_RIGHT|FL_ALIGN_INSIDE|FL_ALIGN_CLIP); lb->labelsize(11);
         Fl_Box* vb=new Fl_Box(cx+lw,cy,cw-lw-4,ROW_H-2,"—");
@@ -231,7 +674,7 @@ public:
 // ── MainWindow ────────────────────────────────────────────────────────────────
 class MainWindow : public Fl_Window {
 public:
-    Fl_Input*        inp_file;
+    Fl_Choice*       inp_file;
     Fl_Button*       btn_browse;
     Fl_Choice*       cho_clk;
     Fl_Check_Button* chk_erase, *chk_verify;
@@ -241,9 +684,10 @@ public:
     Fl_Box*          lbl_status;
     Fl_Text_Display* log_disp;
     Fl_Text_Buffer*  log_buf;
+    Fl_Text_Buffer*  log_style_buf;
 
     // OS Info
-    Fl_Box* inf_os;
+    Fl_Box* inf_os_distro, *inf_os_kernel;
     // File Info
     Fl_Box *inf_fn, *inf_fsz, *inf_fmod, *inf_fcrc, *inf_fck;
     // Programmer Info
@@ -267,11 +711,12 @@ public:
         int y=38;
 
         // ── Controls — full width ─────────────────────────────────────────────
-        // File row
+        // File row — combo shows recent files, Load File button opens full dialog
         new Fl_Box(M,y+3,36,22,"File:");
-        inp_file=new Fl_Input(M+40,y,W-M-40-90-M,26);
+        inp_file=new Fl_Choice(M+40,y,W-M-40-106-M,26);
+        inp_file->textsize(11);
         inp_file->callback(cb_file_changed,this); inp_file->when(FL_WHEN_CHANGED);
-        btn_browse=new Fl_Button(W-90-M,y,84,26,"Browse…");
+        btn_browse=new Fl_Button(W-106-M,y,100,26,"Load File…");
         btn_browse->callback(cb_browse,this); y+=32;
 
         // Clock + options
@@ -284,11 +729,11 @@ public:
         chk_erase->value(1); chk_verify->value(1); y+=32;
 
         // Operation buttons — full width
-        static const char* labels[]={"Detect","Blank","Erase","Program","Verify","Cancel","Read"};
+        static const char* labels[]={"Detect","Blank","Erase","Program","Verify","Read","Cancel"};
         Fl_Button** btns[]={&btn_detect,&btn_blank,&btn_erase,
-                            &btn_prog,&btn_verify,&btn_cancel,&btn_read};
+                            &btn_prog,&btn_verify,&btn_read,&btn_cancel};
         Fl_Callback* cbs[]={cb_detect,cb_blank,cb_erase,
-                            cb_prog,cb_verify,cb_cancel,cb_read};
+                            cb_prog,cb_verify,cb_read,cb_cancel};
         int bw=(W-M*2-24)/7;
         for(int i=0;i<7;i++){
             *btns[i]=new Fl_Button(M+i*(bw+4),y,bw,30,labels[i]);
@@ -301,11 +746,12 @@ public:
         y+=36;
 
         // Progress + status — full width
-        progress=new Fl_Progress(M,y,W-M*2,14);
+        progress=new Fl_Progress(M,y,W-M*2,18);
         progress->minimum(0); progress->maximum(100); progress->value(0);
         progress->color(fl_rgb_color(0xDD,0xDD,0xDD));
         progress->selection_color(fl_rgb_color(25,85,165));
-        progress->labelsize(10); y+=17;
+        progress->labelsize(10); progress->labelcolor(FL_WHITE);
+        progress->labelfont(FL_HELVETICA_BOLD); y+=21;
         lbl_status=new Fl_Box(M,y,W-M*2,16,"Ready — connect programmer and click Detect");
         lbl_status->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE); lbl_status->labelsize(11);
         y+=20;
@@ -320,19 +766,33 @@ public:
 
         // Log — left side, fills full remaining height
         log_buf=new Fl_Text_Buffer();
+        log_style_buf=new Fl_Text_Buffer();
         log_disp=new Fl_Text_Display(LX,y,LW,BOT);
         log_disp->buffer(log_buf);
         log_disp->textfont(FL_COURIER); log_disp->textsize(11);
         log_disp->wrap_mode(Fl_Text_Display::WRAP_AT_BOUNDS,0);
+        // Rich-text style table
+        // A=normal  B=error(red)  C=success(green)  D=info(blue)  E=warning(orange)  F=dim(grey)
+        static Fl_Text_Display::Style_Table_Entry styles[] = {
+            { fl_rgb_color(0x22,0x22,0x22), FL_COURIER,         11 }, // A normal
+            { fl_rgb_color(0xCC,0x00,0x00), FL_COURIER_BOLD,    11 }, // B error
+            { fl_rgb_color(0x00,0x88,0x00), FL_COURIER_BOLD,    11 }, // C success
+            { fl_rgb_color(0x00,0x55,0xBB), FL_COURIER,         11 }, // D info/detect
+            { fl_rgb_color(0xAA,0x66,0x00), FL_COURIER_BOLD,    11 }, // E warning
+            { fl_rgb_color(0x88,0x88,0x88), FL_COURIER,         11 }, // F dim separator
+        };
+        log_disp->highlight_data(log_style_buf, styles,
+            sizeof(styles)/sizeof(styles[0]), 'A', nullptr, nullptr);
         resizable(log_disp);
 
         // ── RIGHT COLUMN: 4 info panels stacked ──────────────────────────────
         int ry = y;
 
-        // OS Info — 1 data row
-        int os_h = 20 + 1*19 + 8;
+        // OS Info — 2 data rows
+        int os_h = 20 + 2*19 + 8;
         InfoPanel* pos=new InfoPanel(RX,ry,RW,os_h,"OS Info"); pos->begin();
-        inf_os=pos->add_val(0,0,1,"OS Version:"); pos->end();
+        inf_os_distro=pos->add_val(0,0,1,"OS:");
+        inf_os_kernel=pos->add_val(1,0,1,"Kernel:"); pos->end();
         ry += os_h + M;
 
         // File Info — 5 data rows
@@ -373,21 +833,105 @@ public:
 
         end();
 
-        // Fill OS info immediately
+        // Fill OS info: distro from /etc/os-release, kernel from uname
         struct utsname u; uname(&u);
-        char osi[128]; snprintf(osi,sizeof(osi),"%s %s",u.sysname,u.release);
-        InfoPanel::set(inf_os, osi);
+        char kernel_str[128];
+        snprintf(kernel_str, sizeof(kernel_str), "%s %s", u.sysname, u.release);
+        InfoPanel::set(inf_os_kernel, kernel_str);
+        char distro[128] = "";
+        if (FILE* f = fopen("/etc/os-release","r")) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
+                    char* p = line + 12;
+                    if (*p == '"') p++;
+                    size_t len = strlen(p);
+                    while (len > 0 && (p[len-1]=='"'||p[len-1]=='\n'||p[len-1]=='\r')) p[--len]=0;
+                    snprintf(distro, sizeof(distro), "%s", p);
+                    break;
+                }
+            }
+            fclose(f);
+        }
+        InfoPanel::set(inf_os_distro, distro[0] ? distro : "");
     }
 
     // ── Logging ───────────────────────────────────────────────────────────────
     void log(const std::string& msg) {
         std::lock_guard<std::mutex> lk(g_log_mutex);
-        log_buf->append((msg+"\n").c_str());
+        // Determine style character for this line
+        char sc = 'A'; // default: normal
+        // Check first non-space UTF-8 char or known prefixes
+        const char* p = msg.c_str();
+        while (*p == ' ') p++;
+        // UTF-8 check_marks: ✓ = E2 9C 93, ✗ = E2 9C 97, ⚠ = E2 9A A0
+        // ─── separator = E2 94 80
+        if ((unsigned char)p[0]==0xE2 && (unsigned char)p[1]==0x9C && (unsigned char)p[2]==0x93)
+            sc = 'C'; // ✓ success
+        else if ((unsigned char)p[0]==0xE2 && (unsigned char)p[1]==0x9C && (unsigned char)p[2]==0x97)
+            sc = 'B'; // ✗ error
+        else if ((unsigned char)p[0]==0xE2 && (unsigned char)p[1]==0x9A && (unsigned char)p[2]==0xA0)
+            sc = 'E'; // ⚠ warning
+        else if ((unsigned char)p[0]==0xE2 && (unsigned char)p[1]==0x94 && (unsigned char)p[2]==0x80)
+            sc = 'F'; // ─── separator
+        else if (msg.find("FAILED")!=std::string::npos || msg.find("Error")!=std::string::npos
+                 || msg.find("error")!=std::string::npos || msg.find("Warning")!=std::string::npos
+                 || msg.find("not found")!=std::string::npos || msg.find("not identified")!=std::string::npos)
+            sc = 'B'; // error red
+        else if (msg.find("OK")!=std::string::npos || msg.find("ok")!=std::string::npos
+                 || msg.find("Selected:")!=std::string::npos || msg.find("Detect OK")!=std::string::npos)
+            sc = 'C'; // success green
+        else if (msg.find("Device ")!=std::string::npos || msg.find("File:")!=std::string::npos
+                 || msg.find("Format:")!=std::string::npos || msg.find("USB OK")!=std::string::npos)
+            sc = 'D'; // info blue
+        // Append text + matching style bytes (one style byte per char incl newline)
+        std::string line = msg + "\n";
+        std::string style(line.size(), sc);
+        log_buf->append(line.c_str());
+        log_style_buf->append(style.c_str());
         log_disp->scroll(log_buf->count_lines(0,log_buf->length()),0);
         log_disp->redraw();
     }
     void set_status(const char* s){ lbl_status->copy_label(s); lbl_status->redraw(); }
-    void set_progress(int v)      { progress->value((float)v); progress->redraw(); }
+    void set_ui_busy(bool busy) {
+        // During an op: disable all controls except Cancel
+        if (busy) {
+            btn_detect->deactivate(); btn_blank->deactivate();
+            btn_erase->deactivate();  btn_prog->deactivate();
+            btn_verify->deactivate(); btn_read->deactivate();
+            btn_browse->deactivate(); inp_file->deactivate();
+            cho_clk->deactivate();    chk_erase->deactivate();
+            chk_verify->deactivate();
+        } else {
+            btn_detect->activate();   btn_blank->activate();
+            btn_erase->activate();    btn_prog->activate();
+            btn_verify->activate();   btn_read->activate();
+            btn_browse->activate();   inp_file->activate();
+            cho_clk->activate();      chk_erase->activate();
+            chk_verify->activate();
+        }
+    }
+    // Real progress: shows "N%" with colour that flips at 50% so it
+    // is always readable against either the filled or unfilled bar.
+    void set_progress(int v) {
+        progress->value((float)v);
+        if (v > 0 && v < 100) {
+            static char pct_lbl[8];
+            snprintf(pct_lbl, sizeof(pct_lbl), "%d%%", v);
+            progress->label(pct_lbl);
+            // White when bar covers the label (>= 50%), dark otherwise
+            progress->labelcolor(v >= 50 ? FL_WHITE : fl_rgb_color(0x22,0x22,0x22));
+        } else {
+            progress->label(nullptr);
+        }
+        progress->redraw();
+    }
+    // Marquee animation: no label, just moves the bar silently
+    void set_progress_marquee(int v) {
+        progress->label(nullptr);
+        progress->value((float)v);
+        progress->redraw();
+    }
 
     // ── Pipe output processing ────────────────────────────────────────────────
     // The SF100 library progress loop does:  printf("\r%0.1fs elapsed", t)
@@ -448,14 +992,15 @@ public:
             if (total > 0) {
                 int pct = (int)(done * 100 / total);
                 if (pct > 100) pct = 100;
-                w->progress->value((float)pct);
+                w->set_progress(pct);
             } else {
                 // Marquee fallback for whole-chip erase (no byte loop)
-                g_marquee_tick = (g_marquee_tick + 2) % 200;
-                int val = (g_marquee_tick < 100) ? g_marquee_tick : (200 - g_marquee_tick);
-                w->progress->value((float)val);
+                // Increment every 2nd tick (100ms effective) = ~40% slower than before
+                static int mq_skip = 0;
+                if (++mq_skip >= 2) { mq_skip = 0; g_marquee_tick = (g_marquee_tick + 1) % 101; }
+                int val = g_marquee_tick;
+                w->set_progress_marquee(val);
             }
-            w->progress->redraw();
         }
         Fl::repeat_timeout(0.05, progress_timer_cb, v);
     }
@@ -621,6 +1166,7 @@ public:
         if(!g_usb_open&&!init_usb()){fl_alert("Programmer not connected.");return;}
         if(!g_chip_selected){fl_alert("No chip selected.\nClick Detect first.");return;}
         g_running=true;
+        set_ui_busy(true);
         set_status((name+"…").c_str()); set_progress(0);
         log("─── "+name+" ───");
         apply_settings(); setup();
@@ -641,6 +1187,7 @@ public:
         // (progress_timer_cb runs permanently from main)
             drain_and_stop();
             set_progress(100);
+            set_ui_busy(false);
             // code: 0=PASS 1=USB 2=ERASE 3=PROG 4=VERIFY 5=LFWV 6=READ 7=BLANK 8=BATCH 9=CSUM 10=IDENTIFY 11=FW 12=OTHER
             log(ok ? ("✓  "+name+" OK") : ("✗  "+name+" FAILED (code "+std::to_string(r)+")"));
             set_status(ok?(name+" OK").c_str():(name+" FAILED").c_str());
@@ -654,17 +1201,28 @@ public:
     // ── Callbacks ─────────────────────────────────────────────────────────────
     static void cb_file_changed(Fl_Widget*,void* v){
         auto* w=(MainWindow*)v;
-        w->cur_file=w->inp_file->value();
+        int idx=w->inp_file->value();
+        const char* t=(idx>=0)?w->inp_file->text(idx):"";
+        w->cur_file=t?t:"";
         w->refresh_file_info(w->cur_file);
     }
     static void cb_browse(Fl_Widget*,void* v){
         auto* w=(MainWindow*)v;
-        std::string p=native_pick("Select Firmware File","*.bin *.hex *.img *.s19 *.srec");
-        if(!p.empty()){
-            w->inp_file->value(p.c_str());
-            w->cur_file=p; w->refresh_file_info(p);
-            w->log("File: "+p);
-        }
+        std::string p=w->cur_file;
+        FileFormat fmt=g_file_format;
+        bool trunc=g_truncate;
+        size_t csz=g_chip_selected?Chip_Info.ChipSizeInByte:0;
+        if(!show_load_file_dialog(p,fmt,trunc,csz)) return;
+        // Add to combo if not already present
+        bool found=false;
+        for(int i=0;i<w->inp_file->size()-1;i++)
+            if(std::string(w->inp_file->text(i))==p){w->inp_file->value(i);found=true;break;}
+        if(!found){w->inp_file->insert(0,p.c_str(),0,nullptr);w->inp_file->value(0);}
+        w->cur_file=p;
+        w->refresh_file_info(p);
+        w->log("File: "+p);
+        const char* fmtname[]={"Auto","Raw Binary","Intel Hex","Motorola S19"};
+        w->log(std::string("Format: ")+fmtname[(int)fmt]+(trunc?" | Truncate to chip size":""));
     }
 
     // Detect: GetFirstDetectionMatch handles VCC cycling + SetTargetFlash.
@@ -675,148 +1233,72 @@ public:
         auto* w=(MainWindow*)v;
         if(g_running.load()){fl_alert("Operation in progress.");return;}
         if(!g_usb_open&&!w->init_usb()){fl_alert("Programmer not connected.");return;}
+
+        // Parse the chip DB once — fast enough to do inline (~1266 entries)
+        std::vector<ChipEntry> all_chips = parse_chip_db();
+
+        // Run hardware detection in a thread to get the auto-detected candidates
         g_running=true;
-        w->set_status("Detecting…"); w->set_progress(0); w->log("─── Detect ───");
+        w->set_status("Detecting\xe2\x80\xa6"); w->set_progress(0); w->log("\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Detect \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80");
         w->apply_settings();
 
-        std::thread([w](){
+        std::thread([w, all_chips](){
             int dcnt=get_usb_dev_cnt(); bool ok=false;
 
             for(int i=0;i<dcnt;i++){
-                // Do NOT clear strTypeName before calling — GetFirstDetectionMatch
-                // reads strlen(TypeName) to decide VCC save/restore behaviour.
+                // Hardware detection — populates strTypeName with space-separated matches
                 CHIP_INFO ci = GetFirstDetectionMatch(strTypeName, i);
+                unsigned int uid = ReadUID(i);
 
-                if(!ci.UniqueID){
-                    Fl::lock();
-                    char msg[64]; snprintf(msg,sizeof(msg),"Device %d: chip not identified.",i+1);
-                    w->log(msg); Fl::unlock();
-                    continue;
-                }
-
-                // strTypeName now holds the last FlashIdentifier result —
-                // space-separated when search_all=0 found one match (just that name),
-                // but may hold multiple names if the DB appended them.
-                // Parse into a deduplicated list.
-                std::vector<std::string> unames;
-                {
+                // Parse strTypeName into deduplicated auto-detected list
+                std::vector<std::string> auto_det;
+                if(ci.UniqueID){
                     char buf[1024]; strncpy(buf, strTypeName, sizeof(buf)-1);
                     char* tok = strtok(buf, " ");
                     while(tok){
                         if(*tok){
                             bool dup=false;
-                            for(auto& u:unames) if(u==tok){dup=true;break;}
-                            if(!dup) unames.push_back(tok);
+                            for(auto& u:auto_det) if(u==tok){dup=true;break;}
+                            if(!dup) auto_det.push_back(tok);
                         }
                         tok=strtok(nullptr," ");
                     }
-                }
-                // Always include ci.TypeName as the first/only option if list is empty
-                if(unames.empty()) unames.push_back(ci.TypeName);
+                    if(auto_det.empty()) auto_det.push_back(ci.TypeName);
+                    std::sort(auto_det.begin(), auto_det.end());
 
-                unsigned int uid = ReadUID(i);
-                std::string chosen = ci.TypeName;  // default: what GetFirstDetectionMatch found
-
-                if(unames.size() > 1){
-                    // Log all candidates
-                    Fl::lock();
                     char msg[256];
-                    snprintf(msg,sizeof(msg),
-                             "Device %d (SF%06u): %zu matching chips — select one:",
-                             i+1, uid, unames.size());
-                    w->log(msg);
-                    for(size_t n=0;n<unames.size();n++){
-                        char line[128];
-                        snprintf(line,sizeof(line),"  [%zu] %s", n+1, unames[n].c_str());
-                        w->log(line);
-                    }
-                    Fl::unlock();
-
-                    // ── Modal list dialog: select chip or cancel ─────────────
-                    // s_sel=-1 means cancelled; >=0 is the chosen index.
-                    Fl::lock();
-                    static int s_sel;
-                    s_sel = 0;   // default highlight
-
-                    const int DW = 420, ITEM_H = 22, LIST_H = std::min((int)unames.size(),12)*ITEM_H;
-                    const int DH = 8+24+8+LIST_H+8+28+8;
-
-                    Fl_Window* dlg = new Fl_Window(DW, DH, "Select Chip");
-                    dlg->begin();
-
-                    // Prompt label
-                    Fl_Box* prompt = new Fl_Box(8, 8, DW-16, 24,
-                        "Multiple chips match this JEDEC ID — select the installed chip:");
-                    prompt->labelsize(11);
-                    prompt->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE|FL_ALIGN_WRAP);
-
-                    // Scrollable browser (Fl_Select_Browser = single-select list)
-                    int by = 8+24+8;
-                    Fl_Select_Browser* lst = new Fl_Select_Browser(8, by, DW-16, LIST_H);
-                    lst->textsize(12);
-                    for(auto& n : unames) lst->add(n.c_str());
-                    lst->value(1);   // highlight first item
-                    // Double-click closes dialog as OK
-                    lst->callback([](Fl_Widget* wb, void* dlgv){
-                        if(Fl::event_clicks() >= 1)
-                            ((Fl_Window*)dlgv)->hide();
-                    }, dlg);
-
-                    // OK / Cancel buttons
-                    int btn_y = by + LIST_H + 8;
-                    Fl_Button* btn_ok  = new Fl_Button(DW-180, btn_y, 80, 26, "OK");
-                    Fl_Button* btn_can = new Fl_Button(DW-90,  btn_y, 80, 26, "Cancel");
-
-                    btn_ok->callback([](Fl_Widget* wb, void* dlgv){
-                        ((Fl_Window*)dlgv)->hide();
-                    }, dlg);
-                    btn_can->callback([](Fl_Widget* wb, void* dlgv){
-                        s_sel = -1;            // signal: cancelled
-                        ((Fl_Window*)dlgv)->hide();
-                    }, dlg);
-
-                    // Pressing Escape = Cancel
-                    dlg->callback([](Fl_Widget* dlgw, void*){
-                        s_sel = -1;
-                        dlgw->hide();
-                    });
-
-                    dlg->end();
-                    dlg->set_modal();
-                    dlg->show();
-                    while(dlg->shown()) Fl::wait();
-
-                    // Read selection before deleting
-                    if(s_sel >= 0) s_sel = lst->value() - 1;  // Fl_Browser is 1-based
-                    delete dlg;
-                    Fl::unlock();
-
-                    if(s_sel < 0){
-                        // User cancelled — leave chip unidentified
-                        Fl::lock();
-                        w->log("✗  Chip selection cancelled — no chip selected.");
-                        w->set_status("No chip selected");
-                        g_chip_selected = false;
-                        Fl::unlock();
-                        continue;   // skip to next device (loop); ok stays false
-                    }
-
-                    chosen = unames[s_sel];
-
-                    // Load chosen chip's full CHIP_INFO
-                    char name_buf[256]; strncpy(name_buf, chosen.c_str(), sizeof(name_buf)-1);
-                    if(Dedi_Search_Chip_Db_ByTypeName(name_buf, &Chip_Info))
-                        strncpy(strTypeName, chosen.c_str(), 1023);
-
-                    Fl::lock(); w->log("Selected: " + chosen); Fl::unlock();
+                    snprintf(msg,sizeof(msg),"Device %d (SF%06u): auto-detected %zu match(es)",
+                             i+1, uid, auto_det.size());
+                    Fl::lock(); w->log(msg); Fl::unlock();
                 } else {
-                    // Single match — use ci directly (already the correct CHIP_INFO)
+                    char msg[64];
+                    snprintf(msg,sizeof(msg),"Device %d: no chip detected by hardware — manual selection available.",i+1);
+                    Fl::lock(); w->log(msg); Fl::unlock();
+                }
+
+                // Show the Windows-style chip select dialog (always, like the Windows app)
+                std::string chosen;
+                Fl::lock();
+                chosen = show_chip_select_dialog(auto_det, all_chips);
+                Fl::unlock();
+
+                if(chosen.empty()){
+                    Fl::lock();
+                    w->log("\xe2\x9c\x97  Chip selection cancelled.");
+                    w->set_status("No chip selected");
+                    g_chip_selected = false;
+                    Fl::unlock();
+                    continue;
+                }
+
+                // Load full CHIP_INFO for chosen chip
+                char name_buf[256]; strncpy(name_buf, chosen.c_str(), sizeof(name_buf)-1);
+                if(Dedi_Search_Chip_Db_ByTypeName(name_buf, &Chip_Info)){
+                    strncpy(strTypeName, chosen.c_str(), 1023);
+                } else if(ci.UniqueID) {
+                    // Fallback: use what hardware found
                     Chip_Info = ci;
                     strncpy(strTypeName, ci.TypeName, 1023);
-                    char msg[256];
-                    snprintf(msg,sizeof(msg),"Device %d (SF%06u):  [ %s ]  —  %zu KB",
-                             i+1, uid, ci.TypeName, ci.ChipSizeInByte/1024);
-                    Fl::lock(); w->log(msg); Fl::unlock();
                 }
 
                 // Auto-set VCC from chip VoltageInMv
@@ -825,13 +1307,19 @@ public:
                     else if(Chip_Info.VoltageInMv <= 2500) g_Vcc = 0x11;
                     else                                    g_Vcc = 0x10;
                 }
+
+                char logmsg[256];
+                snprintf(logmsg,sizeof(logmsg),"\xe2\x9c\x93  Selected: %s  \xe2\x80\x94  %zu KB",
+                         Chip_Info.TypeName, Chip_Info.ChipSizeInByte/1024);
+                Fl::lock(); w->log(logmsg); Fl::unlock();
                 ok = true;
             }
 
             Fl::lock();
             w->set_progress(100);
+            w->set_ui_busy(false);
             g_chip_selected = ok;
-            w->log(ok ? "✓  Detect OK" : "✗  Detect FAILED — chip not identified");
+            w->log(ok ? "\xe2\x9c\x93  Detect OK" : "\xe2\x9c\x97  Detect FAILED \xe2\x80\x94 chip not identified");
             w->set_status(ok ? "Detect OK" : "Detect FAILED");
             w->refresh_prog_info(); w->refresh_mem_info();
             g_running = false;
@@ -839,7 +1327,7 @@ public:
         }).detach();
     }
 
-    static void cb_blank(Fl_Widget*,void* v){
+        static void cb_blank(Fl_Widget*,void* v){
         ((MainWindow*)v)->run_async("Blank Check",[](){g_ucOperation=BLANK;});
     }
     static void cb_erase(Fl_Widget*,void* v){
@@ -848,27 +1336,34 @@ public:
     }
     static void cb_prog(Fl_Widget*,void* v){
         auto* w=(MainWindow*)v;
-        std::string fp=w->inp_file->value();
+        std::string fp=w->cur_file;
         if(fp.empty()){fl_alert("Select a firmware file first.");return;}
+        if(access(fp.c_str(),R_OK)!=0){fl_alert("File not found:\n%s",fp.c_str());return;}
         bool de=w->chk_erase->value(), dv=w->chk_verify->value();
         static std::string sp; sp=fp;
         w->run_async("Program",[de,dv](){
             g_ucOperation=PROGRAM;
             if(de) g_ucOperation|=ERASE;
             if(dv) g_ucOperation|=VERIFY;
+            g_uiAddr=0;
+            g_uiLen=g_truncate?Chip_Info.ChipSizeInByte:0;
+            load_file_with_format(sp.c_str(), g_file_format);
+            SaveProgContextChanges();
             g_parameter_program=const_cast<char*>(sp.c_str());
         });
     }
     static void cb_verify(Fl_Widget*,void* v){
         auto* w=(MainWindow*)v;
-        std::string fp=w->inp_file->value();
+        std::string fp=w->cur_file;
         if(fp.empty()){fl_alert("Select a firmware file first.");return;}
+        if(access(fp.c_str(),R_OK)!=0){fl_alert("File not found:\n%s",fp.c_str());return;}
         if(g_running.load()){fl_alert("Operation in progress.");return;}
         if(!g_usb_open&&!w->init_usb()){fl_alert("Programmer not connected.");return;}
         if(!g_chip_selected){fl_alert("No chip selected.\nClick Detect first.");return;}
 
         static std::string sp; sp=fp;
         g_running=true;
+        w->set_ui_busy(true);
         w->set_status("Verify…"); w->set_progress(0);
         w->log("─── Verify ───");
         w->apply_settings();
@@ -883,9 +1378,8 @@ public:
 
         std::thread([w](){
             g_uiAddr = 0;
-            g_uiLen  = 0;
-            char fname[4096]; strncpy(fname, sp.c_str(), sizeof(fname)-1);
-            LoadFile(fname);
+            g_uiLen  = g_truncate ? Chip_Info.ChipSizeInByte : 0;
+            load_file_with_format(sp.c_str(), g_file_format);
             SaveProgContextChanges();
             g_ucOperation = VERIFY;
 
@@ -896,6 +1390,7 @@ public:
         // (progress_timer_cb runs permanently from main)
             w->drain_and_stop();
             w->set_progress(100);
+            w->set_ui_busy(false);
             w->log(ok ? "✓  Verify OK" : ("✗  Verify FAILED (code "+std::to_string(r)+")"));
             w->set_status(ok ? "Verify OK" : "Verify FAILED");
             w->refresh_prog_info(); w->refresh_mem_info();
@@ -937,10 +1432,14 @@ int main(int argc,char** argv){
     Fl::background(0xF0,0xF0,0xF0);
     Fl::background2(0xFF,0xFF,0xFF);
     Fl::foreground(0x22,0x22,0x22);
+    recent_load();
     MainWindow* win=new MainWindow(1100,680);
     win->resizable(win);
     win->size_range(900,560,0,0);
     win->show(argc,argv);
+    // Populate file combo with recent files
+    for(auto& r:g_recent_files) win->inp_file->add(r.c_str());
+    if(win->inp_file->size()>1) { win->inp_file->value(0); win->cur_file=win->inp_file->text(0); win->refresh_file_info(win->cur_file); }
     win->log("DediProg Linux GUI  —  V1.14.21.x natively integrated");
     win->log("Connect your SF100/SF600 via USB, then click Detect.");
     // Permanent 50ms timer drives Cancel button enable/disable via g_running

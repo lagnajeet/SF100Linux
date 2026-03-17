@@ -1440,7 +1440,7 @@ int main(int argc,char** argv){
     // Populate file combo with recent files
     for(auto& r:g_recent_files) win->inp_file->add(r.c_str());
     if(win->inp_file->size()>1) { win->inp_file->value(0); win->cur_file=win->inp_file->text(0); win->refresh_file_info(win->cur_file); }
-    win->log("DediProg Linux GUI  —  V1.14.21.x natively integrated");
+    // win->log("DediProg Linux GUI  —  V1.14.21.x natively integrated");
     win->log("Connect your SF100/SF600 via USB, then click Detect.");
     // Permanent 50ms timer drives Cancel button enable/disable via g_running
     Fl::add_timeout(0.05, MainWindow::progress_timer_cb, win);

@@ -137,10 +137,24 @@ extern "C" {
 }
 
 // ── Colours ───────────────────────────────────────────────────────────────────
-#define COL_HEADER    fl_rgb_color(0x1A,0x3C,0x6E)
-#define COL_PANEL_HDR fl_rgb_color(0xD0,0xDF,0xF0)
-#define COL_PANEL_BG  fl_rgb_color(0xF6,0xF8,0xFC)
-#define COL_BLUE_VAL  fl_rgb_color(0x00,0x55,0xBB)
+// ---- Light theme colours
+#define COL_HEADER_LIGHT    fl_rgb_color(0x1A,0x3C,0x6E)
+#define COL_PANEL_HDR_LIGHT fl_rgb_color(0xD0,0xDF,0xF0)
+#define COL_PANEL_BG_LIGHT  fl_rgb_color(0xF6,0xF8,0xFC)
+#define COL_BLUE_VAL_LIGHT  fl_rgb_color(0x00,0x55,0xBB)
+// ---- Dark theme colours
+#define COL_HEADER_DARK     fl_rgb_color(0x0D,0x1F,0x3C)
+#define COL_PANEL_HDR_DARK  fl_rgb_color(0x2D,0x2D,0x30)
+#define COL_PANEL_BG_DARK   fl_rgb_color(0x25,0x25,0x26)
+#define COL_BLUE_VAL_DARK   fl_rgb_color(0x4F,0xC3,0xF7)
+
+static bool g_dark_mode = false;
+
+// Active theme colours (set by apply_theme)
+static Fl_Color COL_HEADER    = COL_HEADER_LIGHT;
+static Fl_Color COL_PANEL_HDR = COL_PANEL_HDR_LIGHT;
+static Fl_Color COL_PANEL_BG  = COL_PANEL_BG_LIGHT;
+static Fl_Color COL_BLUE_VAL  = COL_BLUE_VAL_LIGHT;
 
 // ── Chip DB parser ────────────────────────────────────────────────────────────
 // On macOS openChipInfoDb is defined in parse.c (uses _NSGetExecutablePath)
@@ -414,6 +428,34 @@ static void recent_add(const std::string& path) {
     fclose(f);
 }
 
+static std::string prefs_path() {
+    const char* home = getenv("HOME");
+    static std::string p;
+    if (home) p = std::string(home) + "/.config/dpgui_prefs";
+    else p = "/tmp/dpgui_prefs";
+    return p;
+}
+static void prefs_save(int x, int y, int w, int h, bool dark) {
+    FILE* f = fopen(prefs_path().c_str(), "w");
+    if (!f) return;
+    fprintf(f, "x=%d\ny=%d\nw=%d\nh=%d\ndark=%d\n", x, y, w, h, dark?1:0);
+    fclose(f);
+}
+static void prefs_load(int& x, int& y, int& w, int& h, bool& dark) {
+    FILE* f = fopen(prefs_path().c_str(), "r");
+    if (!f) return;
+    char line[64];
+    while (fgets(line, sizeof(line), f)) {
+        int v;
+        if      (sscanf(line, "x=%d",    &v)==1) x=v;
+        else if (sscanf(line, "y=%d",    &v)==1) y=v;
+        else if (sscanf(line, "w=%d",    &v)==1) w=v;
+        else if (sscanf(line, "h=%d",    &v)==1) h=v;
+        else if (sscanf(line, "dark=%d", &v)==1) dark=(v!=0);
+    }
+    fclose(f);
+}
+
 // ── File format ───────────────────────────────────────────────────────────────
 enum FileFormat { FMT_AUTO=0, FMT_BIN, FMT_HEX, FMT_S19 };
 static FileFormat g_file_format = FMT_AUTO;
@@ -669,6 +711,10 @@ public:
     }
 };
 
+static Fl_Text_Display::Style_Table_Entry g_log_styles[6];
+// Forward declaration
+static void apply_theme(bool dark);
+
 // ── MainWindow ────────────────────────────────────────────────────────────────
 class MainWindow : public Fl_Window {
 public:
@@ -678,6 +724,7 @@ public:
     Fl_Check_Button* chk_erase, *chk_verify;
     Fl_Button*       btn_detect,*btn_blank,*btn_erase,
                     *btn_prog,  *btn_verify,*btn_cancel,*btn_read;
+    Fl_Button*       btn_theme;
     Fl_Progress*     progress;
     Fl_Box*          lbl_status;
     Fl_Text_Display* log_disp;
@@ -703,9 +750,21 @@ public:
 
         // ── Header (full width) ───────────────────────────────────────────────
         Fl_Box* hb=new Fl_Box(0,0,W,34); hb->box(FL_FLAT_BOX); hb->color(COL_HEADER);
-        Fl_Box* ht=new Fl_Box(12,4,W-100,26,"DediProg  SF100/SF600  GUI");
+        Fl_Box* ht=new Fl_Box(12,4,W-194,26,"DediProg  SF100/SF600  GUI");
         ht->labelcolor(FL_WHITE); ht->labelfont(FL_HELVETICA_BOLD);
         ht->labelsize(14); ht->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE);
+        // Theme toggle button
+        btn_theme = new Fl_Button(W-182,4,84,26,"Dark Mode");
+        btn_theme->box(FL_FLAT_BOX);
+        btn_theme->color(COL_HEADER);
+        btn_theme->labelcolor(fl_rgb_color(0xAA,0xCC,0xFF));
+        btn_theme->labelfont(FL_HELVETICA);
+        btn_theme->labelsize(12);
+        btn_theme->callback([](Fl_Widget* wb, void* v){
+            g_dark_mode = !g_dark_mode;
+            wb->copy_label(g_dark_mode ? "Light Mode" : "Dark Mode");
+            apply_theme(g_dark_mode);
+        }, this);
         // About button — top right of header
         Fl_Button* btn_about = new Fl_Button(W-90,4,82,26,"About");
         btn_about->box(FL_FLAT_BOX);
@@ -825,6 +884,13 @@ public:
         btn_prog->color(fl_rgb_color(25,85,165));   btn_prog->labelcolor(FL_WHITE);
         btn_cancel->color(fl_rgb_color(140,60,10)); btn_cancel->labelcolor(FL_WHITE);
         btn_cancel->deactivate();  // enabled only while an operation is running
+        btn_detect->tooltip("Probe the connected chip and select from matching database entries");
+        btn_blank->tooltip("Check if the chip contains only 0xFF bytes (fully erased)");
+        btn_erase->tooltip("Erase the entire chip (all bytes set to 0xFF)");
+        btn_prog->tooltip("Write the loaded file to the chip");
+        btn_verify->tooltip("Compare chip contents against the loaded file");
+        btn_read->tooltip("Read the entire chip and save to a file");
+        btn_cancel->tooltip("Abort the current operation (may require power-cycle after)");
         y+=36;
 
         // Progress + status — full width
@@ -834,7 +900,8 @@ public:
         progress->selection_color(fl_rgb_color(25,85,165));
         progress->labelsize(10); progress->labelcolor(FL_WHITE);
         progress->labelfont(FL_HELVETICA_BOLD); y+=21;
-        lbl_status=new Fl_Box(M,y,W-M*2,16,"Ready — connect programmer and click Detect");
+        // Status label and Clear Log button on the same row
+        lbl_status=new Fl_Box(M,y,W-M*2-70,18,"Ready — connect programmer and click Detect");
         lbl_status->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE); lbl_status->labelsize(11);
         y+=20;
 
@@ -849,22 +916,27 @@ public:
         // Log — left side, fills full remaining height
         log_buf=new Fl_Text_Buffer();
         log_style_buf=new Fl_Text_Buffer();
+        // Clear Log button — right-aligned to log box, same row as status label
+        Fl_Button* btn_clear = new Fl_Button(LX+LW-64, y-20, 64, 18, "Clear Log");
+        btn_clear->labelsize(10);
+        btn_clear->callback([](Fl_Widget*,void* v){
+            MainWindow* w=(MainWindow*)v;
+            w->log_buf->text("");
+            w->log_style_buf->text("");
+        }, this);
         log_disp=new Fl_Text_Display(LX,y,LW,BOT);
         log_disp->buffer(log_buf);
         log_disp->textfont(FL_COURIER); log_disp->textsize(11);
         log_disp->wrap_mode(Fl_Text_Display::WRAP_AT_BOUNDS,0);
         // Rich-text style table
         // A=normal  B=error(red)  C=success(green)  D=info(blue)  E=warning(orange)  F=dim(grey)
-        static Fl_Text_Display::Style_Table_Entry styles[] = {
-            { fl_rgb_color(0x22,0x22,0x22), FL_COURIER,         11 }, // A normal
-            { fl_rgb_color(0xCC,0x00,0x00), FL_COURIER_BOLD,    11 }, // B error
-            { fl_rgb_color(0x00,0x88,0x00), FL_COURIER_BOLD,    11 }, // C success
-            { fl_rgb_color(0x00,0x55,0xBB), FL_COURIER,         11 }, // D info/detect
-            { fl_rgb_color(0xAA,0x66,0x00), FL_COURIER_BOLD,    11 }, // E warning
-            { fl_rgb_color(0x88,0x88,0x88), FL_COURIER,         11 }, // F dim separator
-        };
-        log_disp->highlight_data(log_style_buf, styles,
-            sizeof(styles)/sizeof(styles[0]), 'A', nullptr, nullptr);
+        g_log_styles[0] = { fl_rgb_color(0x22,0x22,0x22), FL_COURIER,      11 };
+        g_log_styles[1] = { fl_rgb_color(0xCC,0x00,0x00), FL_COURIER_BOLD, 11 };
+        g_log_styles[2] = { fl_rgb_color(0x00,0x88,0x00), FL_COURIER_BOLD, 11 };
+        g_log_styles[3] = { fl_rgb_color(0x00,0x55,0xBB), FL_COURIER,      11 };
+        g_log_styles[4] = { fl_rgb_color(0xAA,0x66,0x00), FL_COURIER_BOLD, 11 };
+        g_log_styles[5] = { fl_rgb_color(0x88,0x88,0x88), FL_COURIER,      11 };
+        log_disp->highlight_data(log_style_buf, g_log_styles, 6, 'A', nullptr, nullptr);
         resizable(log_disp);
 
         // ── RIGHT COLUMN: 4 info panels stacked ──────────────────────────────
@@ -958,10 +1030,14 @@ public:
     // ── Logging ───────────────────────────────────────────────────────────────
     void log(const std::string& msg) {
         std::lock_guard<std::mutex> lk(g_log_mutex);
+        time_t now = time(nullptr); struct tm* ti = localtime(&now);
+        char ts[12]; strftime(ts, sizeof(ts), "%H:%M:%S  ", ti);
+        std::string stamped = std::string(ts) + msg;
+        const std::string& msg_ref = stamped;
         // Determine style character for this line
         char sc = 'A'; // default: normal
         // Check first non-space UTF-8 char or known prefixes
-        const char* p = msg.c_str();
+        const char* p = msg_ref.c_str();
         while (*p == ' ') p++;
         // UTF-8 check_marks: ✓ = E2 9C 93, ✗ = E2 9C 97, ⚠ = E2 9A A0
         // ─── separator = E2 94 80
@@ -984,7 +1060,7 @@ public:
                  || msg.find("Format:")!=std::string::npos || msg.find("USB OK")!=std::string::npos)
             sc = 'D'; // info blue
         // Append text + matching style bytes (one style byte per char incl newline)
-        std::string line = msg + "\n";
+        std::string line = msg_ref + "\n";
         std::string style(line.size(), sc);
         log_buf->append(line.c_str());
         log_style_buf->append(style.c_str());
@@ -1018,8 +1094,12 @@ public:
             static char pct_lbl[8];
             snprintf(pct_lbl, sizeof(pct_lbl), "%d%%", v);
             progress->label(pct_lbl);
-            // White when bar covers the label (>= 50%), dark otherwise
-            progress->labelcolor(v >= 50 ? FL_WHITE : fl_rgb_color(0x22,0x22,0x22));
+            // In dark mode the unfilled track is dark — use light text throughout
+            // In light mode flip at 50%: dark text on grey track, white on blue fill
+            if (g_dark_mode)
+                progress->labelcolor(FL_WHITE);
+            else
+                progress->labelcolor(v >= 50 ? FL_WHITE : fl_rgb_color(0x22,0x22,0x22));
         } else {
             progress->label(nullptr);
         }
@@ -1158,6 +1238,9 @@ public:
         else if(g_bIsSF600PG2[0]) pt="SF600Plus-G2";
         else if(g_bIsSF600[0])    pt="SF600Plus";
         InfoPanel::set(inf_ptype, pt);
+        // Update window title with programmer model
+        char wt[64]; snprintf(wt, sizeof(wt), "DediProg Software  --  %s", pt);
+        copy_label(wt);
 
         GetFirmwareVer(0);
         char fw[11]={}; memcpy(fw,g_FW_ver,10);
@@ -1543,6 +1626,68 @@ public:
     }
 };
 
+// ── Theme application ─────────────────────────────
+static void apply_theme(bool dark) {
+    if (dark) {
+        Fl::background (0x1E,0x1E,0x1E);
+        Fl::background2(0x25,0x25,0x26);
+        Fl::foreground (0xD4,0xD4,0xD4);
+        COL_HEADER    = COL_HEADER_DARK;
+        COL_PANEL_HDR = COL_PANEL_HDR_DARK;
+        COL_PANEL_BG  = COL_PANEL_BG_DARK;
+        COL_BLUE_VAL  = COL_BLUE_VAL_DARK;
+    } else {
+        Fl::background (0xF0,0xF0,0xF0);
+        Fl::background2(0xFF,0xFF,0xFF);
+        Fl::foreground (0x22,0x22,0x22);
+        COL_HEADER    = COL_HEADER_LIGHT;
+        COL_PANEL_HDR = COL_PANEL_HDR_LIGHT;
+        COL_PANEL_BG  = COL_PANEL_BG_LIGHT;
+        COL_BLUE_VAL  = COL_BLUE_VAL_LIGHT;
+    }
+    // Update log style colours for theme
+    g_log_styles[0].color = dark ? fl_rgb_color(0xCC,0xCC,0xCC) : fl_rgb_color(0x22,0x22,0x22);
+    g_log_styles[3].color = dark ? fl_rgb_color(0x4F,0xC3,0xF7) : fl_rgb_color(0x00,0x55,0xBB);
+    g_log_styles[4].color = dark ? fl_rgb_color(0xFF,0xB7,0x4D) : fl_rgb_color(0xAA,0x66,0x00);
+    g_log_styles[5].color = dark ? fl_rgb_color(0x66,0x66,0x66) : fl_rgb_color(0x88,0x88,0x88);
+    // Walk all widgets and recolour panels, value labels, header boxes
+    for (Fl_Window* win = Fl::first_window(); win; win = Fl::next_window(win)) {
+        // Redraw all children recursively via damage
+        win->color(dark ? fl_rgb_color(0x1E,0x1E,0x1E) : fl_rgb_color(0xF0,0xF0,0xF0));
+        for (int _pi = 0; _pi < win->children(); _pi++) {
+            Fl_Progress* pp = dynamic_cast<Fl_Progress*>(win->child(_pi));
+            if (pp) {
+                pp->color(dark ? fl_rgb_color(0x3C,0x3C,0x3C) : fl_rgb_color(0xDD,0xDD,0xDD));
+                pp->selection_color(dark ? fl_rgb_color(0x15,0x65,0xC0) : fl_rgb_color(25,85,165));
+            }
+        }
+        // Walk every widget in the window
+        for (int i = 0; i < win->children(); i++) {
+            Fl_Widget* w = win->child(i);
+            // Recolour InfoPanel groups and their children
+            Fl_Group* g = w->as_group();
+            if (g) {
+                if (g->color() == (dark ? COL_PANEL_BG_LIGHT : COL_PANEL_BG_DARK))
+                    g->color(COL_PANEL_BG);
+                for (int j = 0; j < g->children(); j++) {
+                    Fl_Widget* cw = g->child(j);
+                    // Panel header rows
+                    if (cw->color() == (dark ? COL_PANEL_HDR_LIGHT : COL_PANEL_HDR_DARK))
+                        cw->color(COL_PANEL_HDR);
+                    // Blue value labels
+                    if (cw->labelcolor() == (dark ? COL_BLUE_VAL_LIGHT : COL_BLUE_VAL_DARK))
+                        cw->labelcolor(COL_BLUE_VAL);
+                }
+            }
+            // Header bar
+            if (w->color() == (dark ? COL_HEADER_LIGHT : COL_HEADER_DARK)) {
+                w->color(COL_HEADER);
+            }
+        }
+        win->redraw();
+    }
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 int main(int argc,char** argv){
     Fl::lock();
@@ -1551,15 +1696,24 @@ int main(int argc,char** argv){
     Fl::background2(0xFF,0xFF,0xFF);
     Fl::foreground(0x22,0x22,0x22);
     recent_load();
-    MainWindow* win=new MainWindow(1100,680);
+    int px=100,py=100,pw=1100,ph=680;
+    prefs_load(px,py,pw,ph,g_dark_mode);
+    MainWindow* win=new MainWindow(pw,ph);
     win->resizable(win);
     win->size_range(900,560,0,0);
+    win->position(px,py);
     win->show(argc,argv);
     // Populate file combo with recent files
     for(auto& r:g_recent_files) win->inp_file->add(r.c_str());
     if(win->inp_file->size()>1) { win->inp_file->value(0); win->cur_file=win->inp_file->text(0); win->refresh_file_info(win->cur_file); }
     win->log("Connect your SF100/SF600 via USB, then click Detect.");
+    if (g_dark_mode) {
+        apply_theme(true);
+        win->btn_theme->copy_label("Light Mode");
+    }
     // Permanent 50ms timer drives Cancel button enable/disable via g_running
     Fl::add_timeout(0.05, MainWindow::progress_timer_cb, win);
-    return Fl::run();
+    int ret = Fl::run();
+    prefs_save(win->x(), win->y(), win->w(), win->h(), g_dark_mode);
+    return ret;
 }

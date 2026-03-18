@@ -35,6 +35,7 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <functional>
 #include <unistd.h>
@@ -1270,98 +1271,117 @@ public:
     // It never writes its TypeName parameter — check ci.UniqueID for success.
     // After success, strTypeName (global) contains space-separated matches from
     // the last FlashIdentifier call inside GetFirstDetectionMatch.
+    // Detect phase 2: runs on main thread after hardware scan completes
+    struct DetectResult {
+        MainWindow*              w;
+        std::vector<std::string> auto_det;
+        std::vector<ChipEntry>   all_chips;
+        CHIP_INFO                ci;
+        unsigned int             uid;
+    };
+    static void detect_phase2(void* ud) {
+        DetectResult* dr = (DetectResult*)ud;
+        MainWindow*   w  = dr->w;
+
+        // Show dialog directly on main thread - no Fl::wait nesting issue
+        std::string chosen = show_chip_select_dialog(dr->auto_det, dr->all_chips);
+
+        if (chosen.empty()) {
+            w->log("\xe2\x9c\x97  Chip selection cancelled.");
+            w->set_status("No chip selected");
+            g_chip_selected = false;
+        } else {
+            char name_buf[256]; strncpy(name_buf, chosen.c_str(), sizeof(name_buf)-1);
+            if (Dedi_Search_Chip_Db_ByTypeName(name_buf, &Chip_Info))
+                strncpy(strTypeName, chosen.c_str(), 1023);
+            else if (dr->ci.UniqueID) {
+                Chip_Info = dr->ci;
+                strncpy(strTypeName, dr->ci.TypeName, 1023);
+            }
+            if (Chip_Info.VoltageInMv > 0) {
+                if      (Chip_Info.VoltageInMv <= 1800) g_Vcc = 0x12;
+                else if (Chip_Info.VoltageInMv <= 2500) g_Vcc = 0x11;
+                else                                     g_Vcc = 0x10;
+            }
+            char logmsg[256];
+            snprintf(logmsg, sizeof(logmsg), "\xe2\x9c\x93  Selected: %s  \xe2\x80\x94  %zu KB",
+                Chip_Info.TypeName, Chip_Info.ChipSizeInByte/1024);
+            w->log(logmsg);
+            g_chip_selected = true;
+            w->log("\xe2\x9c\x93  Detect OK");
+            w->set_status("Detect OK");
+        }
+        w->set_progress(100);
+        w->set_ui_busy(false);
+        w->refresh_prog_info(); w->refresh_mem_info();
+        g_running = false;
+        delete dr;
+    }
+
     static void cb_detect(Fl_Widget*,void* v){
         auto* w=(MainWindow*)v;
         if(g_running.load()){fl_alert("Operation in progress.");return;}
         if(!g_usb_open&&!w->init_usb()){fl_alert("Programmer not connected.");return;}
 
-        // Parse the chip DB once — fast enough to do inline (~1266 entries)
         std::vector<ChipEntry> all_chips = parse_chip_db();
 
-        // Run hardware detection in a thread to get the auto-detected candidates
         g_running=true;
-        w->set_status("Detecting\xe2\x80\xa6"); w->set_progress(0); w->log("\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Detect \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80");
+        w->set_ui_busy(true);
+        w->set_status("Detecting\xe2\x80\xa6"); w->set_progress(0);
+        w->log("\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Detect \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80");
         w->apply_settings();
 
         std::thread([w, all_chips](){
-            int dcnt=get_usb_dev_cnt(); bool ok=false;
+            int dcnt = get_usb_dev_cnt();
 
-            for(int i=0;i<dcnt;i++){
-                // Hardware detection — populates strTypeName with space-separated matches
+            for (int i = 0; i < dcnt; i++) {
                 CHIP_INFO ci = GetFirstDetectionMatch(strTypeName, i);
                 unsigned int uid = ReadUID(i);
 
-                // Parse strTypeName into deduplicated auto-detected list
                 std::vector<std::string> auto_det;
-                if(ci.UniqueID){
+                if (ci.UniqueID) {
                     char buf[1024]; strncpy(buf, strTypeName, sizeof(buf)-1);
                     char* tok = strtok(buf, " ");
-                    while(tok){
-                        if(*tok){
+                    while (tok) {
+                        if (*tok) {
                             bool dup=false;
-                            for(auto& u:auto_det) if(u==tok){dup=true;break;}
-                            if(!dup) auto_det.push_back(tok);
+                            for (auto& u:auto_det) if(u==tok){dup=true;break;}
+                            if (!dup) auto_det.push_back(tok);
                         }
-                        tok=strtok(nullptr," ");
+                        tok = strtok(nullptr, " ");
                     }
-                    if(auto_det.empty()) auto_det.push_back(ci.TypeName);
+                    if (auto_det.empty()) auto_det.push_back(ci.TypeName);
                     std::sort(auto_det.begin(), auto_det.end());
-
                     char msg[256];
-                    snprintf(msg,sizeof(msg),"Device %d (SF%06u): auto-detected %zu match(es)",
-                             i+1, uid, auto_det.size());
+                    snprintf(msg, sizeof(msg),
+                        "Device %d (SF%06u): auto-detected %zu match(es)", i+1, uid, auto_det.size());
                     Fl::lock(); w->log(msg); Fl::unlock();
                 } else {
-                    char msg[64];
-                    snprintf(msg,sizeof(msg),"Device %d: no chip detected by hardware — manual selection available.",i+1);
+                    char msg[80];
+                    snprintf(msg, sizeof(msg),
+                        "Device %d: no chip detected - manual selection available.", i+1);
                     Fl::lock(); w->log(msg); Fl::unlock();
                 }
 
-                // Show the Windows-style chip select dialog (always, like the Windows app)
-                std::string chosen;
-                Fl::lock();
-                chosen = show_chip_select_dialog(auto_det, all_chips);
-                Fl::unlock();
-
-                if(chosen.empty()){
-                    Fl::lock();
-                    w->log("\xe2\x9c\x97  Chip selection cancelled.");
-                    w->set_status("No chip selected");
-                    g_chip_selected = false;
-                    Fl::unlock();
-                    continue;
-                }
-
-                // Load full CHIP_INFO for chosen chip
-                char name_buf[256]; strncpy(name_buf, chosen.c_str(), sizeof(name_buf)-1);
-                if(Dedi_Search_Chip_Db_ByTypeName(name_buf, &Chip_Info)){
-                    strncpy(strTypeName, chosen.c_str(), 1023);
-                } else if(ci.UniqueID) {
-                    // Fallback: use what hardware found
-                    Chip_Info = ci;
-                    strncpy(strTypeName, ci.TypeName, 1023);
-                }
-
-                // Auto-set VCC from chip VoltageInMv
-                if(Chip_Info.VoltageInMv > 0){
-                    if     (Chip_Info.VoltageInMv <= 1800) g_Vcc = 0x12;
-                    else if(Chip_Info.VoltageInMv <= 2500) g_Vcc = 0x11;
-                    else                                    g_Vcc = 0x10;
-                }
-
-                char logmsg[256];
-                snprintf(logmsg,sizeof(logmsg),"\xe2\x9c\x93  Selected: %s  \xe2\x80\x94  %zu KB",
-                         Chip_Info.TypeName, Chip_Info.ChipSizeInByte/1024);
-                Fl::lock(); w->log(logmsg); Fl::unlock();
-                ok = true;
+                // Post phase 2 to main thread and exit worker thread.
+                // This avoids nesting Fl::wait inside an Fl::awake callback (deadlock).
+                DetectResult* dr = new DetectResult;
+                dr->w         = w;
+                dr->auto_det  = auto_det;
+                dr->all_chips = all_chips;
+                dr->ci        = ci;
+                dr->uid       = uid;
+                Fl::awake(detect_phase2, dr);
+                return; // worker done, main thread takes over
             }
 
+            // No devices found at all
             Fl::lock();
             w->set_progress(100);
             w->set_ui_busy(false);
-            g_chip_selected = ok;
-            w->log(ok ? "\xe2\x9c\x93  Detect OK" : "\xe2\x9c\x97  Detect FAILED \xe2\x80\x94 chip not identified");
-            w->set_status(ok ? "Detect OK" : "Detect FAILED");
+            g_chip_selected = false;
+            w->log("\xe2\x9c\x97  Detect FAILED - chip not identified");
+            w->set_status("Detect FAILED");
             w->refresh_prog_info(); w->refresh_mem_info();
             g_running = false;
             Fl::unlock(); Fl::awake();

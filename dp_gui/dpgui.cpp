@@ -48,7 +48,10 @@
 #include <cstdint>
 #include <stdint.h>
 
-// ── Override openChipInfoDb ───────────────────────────────────────────────────
+// ── Override openChipInfoDb (Linux only) ─────────────────────────────────────
+// On macOS, parse.c already has a native _NSGetExecutablePath implementation
+// that finds the DB next to the binary — no override needed.
+#ifndef __APPLE__
 extern "C" FILE* openChipInfoDb_orig(void);
 extern "C" FILE* openChipInfoDb(void) {
     if (FILE* f = openChipInfoDb_orig()) return f;
@@ -68,6 +71,7 @@ extern "C" FILE* openChipInfoDb(void) {
     fprintf(stderr, "Error: ChipInfoDb.dedicfg not found.\n");
     return nullptr;
 }
+#endif // __APPLE__
 
 // ── SF100Linux C API ──────────────────────────────────────────────────────────
 extern "C" {
@@ -76,6 +80,9 @@ extern "C" {
 #include "usbdriver.h"
 #include "Macro.h"
 #include "board.h"
+#ifdef __APPLE__
+#undef FREAD  // conflicts with macOS fcntl.h macro
+#endif
 #include "SerialFlash.h"
 
     extern char           g_board_type[8];
@@ -134,6 +141,10 @@ extern "C" {
 #define COL_BLUE_VAL  fl_rgb_color(0x00,0x55,0xBB)
 
 // ── Chip DB parser ────────────────────────────────────────────────────────────
+// On macOS openChipInfoDb is defined in parse.c (uses _NSGetExecutablePath)
+#ifdef __APPLE__
+extern "C" FILE* openChipInfoDb(void);
+#endif
 // Parses ChipInfoDb.dedicfg (XML, UTF-16LE with CRLF line endings) and returns
 // a flat list of {TypeName, Manufacturer} for every SPI NOR chip entry.
 struct ChipEntry { std::string name, manufacturer; };
@@ -360,6 +371,11 @@ static std::string show_chip_select_dialog(
 
 // Forward declaration (defined later with native file picker)
 static std::string native_pick(const char* title, const char* glob, bool save);
+#ifdef __APPLE__
+// Declared in mac_filepicker.mm
+std::string mac_pick_open(const char* title, const char* glob);
+std::string mac_pick_save(const char* title);
+#endif
 
 // ── Recent files ──────────────────────────────────────────────────────────────
 static const int RECENT_MAX = 10;
@@ -596,8 +612,15 @@ static int               g_marquee_tick = 0;       // drives progress bar animat
 
 // ── Native file picker ────────────────────────────────────────────────────────
 static std::string native_pick(const char* title, const char* glob, bool save=false) {
-    char cmd[1024];
-    // Try zenity first
+    char cmd[2048];
+
+#ifdef __APPLE__
+    // macOS: native Cocoa NSOpenPanel / NSSavePanel
+    if (!save) return mac_pick_open(title, glob);
+    else       return mac_pick_save(title);
+
+#else
+    // Linux: try zenity then kdialog
     if (!save)
         snprintf(cmd,sizeof(cmd),
             "zenity --file-selection --title='%s' "
@@ -615,7 +638,6 @@ static std::string native_pick(const char* title, const char* glob, bool save=fa
             buf[strcspn(buf,"\n")]=0; return buf;
         }
     }
-    // Try kdialog
     if (!save)
         snprintf(cmd,sizeof(cmd),
             "kdialog --getopenfilename . '%s' --title '%s' 2>/dev/null",glob,title);
@@ -631,7 +653,9 @@ static std::string native_pick(const char* title, const char* glob, bool save=fa
             buf[strcspn(buf,"\n")]=0; return buf;
         }
     }
-    // FLTK fallback
+#endif
+
+    // FLTK fallback (both platforms)
     int mode = save ? Fl_File_Chooser::CREATE : Fl_File_Chooser::SINGLE;
     Fl_File_Chooser fc(".", (std::string(glob)+" files ("+glob+")").c_str(), mode, title);
     fc.show(); while(fc.shown()) Fl::wait();
@@ -699,13 +723,13 @@ public:
 
     std::string cur_file;
 
-    MainWindow(int W,int H) : Fl_Window(W,H,"DediProg Software  Linux GUI") {
+    MainWindow(int W,int H) : Fl_Window(W,H,"DediProg Software") {
         begin();
         int M=8;
 
         // ── Header (full width) ───────────────────────────────────────────────
         Fl_Box* hb=new Fl_Box(0,0,W,34); hb->box(FL_FLAT_BOX); hb->color(COL_HEADER);
-        Fl_Box* ht=new Fl_Box(12,4,W-24,26,"DediProg  SF100/SF600  Linux GUI");
+        Fl_Box* ht=new Fl_Box(12,4,W-24,26,"DediProg  SF100/SF600  GUI");
         ht->labelcolor(FL_WHITE); ht->labelfont(FL_HELVETICA_BOLD);
         ht->labelsize(14); ht->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE);
         int y=38;
@@ -833,12 +857,28 @@ public:
 
         end();
 
-        // Fill OS info: distro from /etc/os-release, kernel from uname
+        // Fill OS info: distro name + kernel version
         struct utsname u; uname(&u);
         char kernel_str[128];
         snprintf(kernel_str, sizeof(kernel_str), "%s %s", u.sysname, u.release);
         InfoPanel::set(inf_os_kernel, kernel_str);
         char distro[128] = "";
+#ifdef __APPLE__
+        // macOS: use sw_vers to get product name and version
+        {
+            char name[64]="", ver[32]="";
+            FILE* pf;
+            pf = popen("sw_vers -productName 2>/dev/null", "r");
+            if (pf) { fgets(name, sizeof(name), pf); pclose(pf); }
+            pf = popen("sw_vers -productVersion 2>/dev/null", "r");
+            if (pf) { fgets(ver, sizeof(ver), pf); pclose(pf); }
+            name[strcspn(name,"\n")]=0;
+            ver[strcspn(ver,"\n")]=0;
+            if (name[0] && ver[0])
+                snprintf(distro, sizeof(distro), "%s %s", name, ver);
+        }
+#else
+        // Linux: read PRETTY_NAME from /etc/os-release
         if (FILE* f = fopen("/etc/os-release","r")) {
             char line[256];
             while (fgets(line, sizeof(line), f)) {
@@ -853,6 +893,7 @@ public:
             }
             fclose(f);
         }
+#endif
         InfoPanel::set(inf_os_distro, distro[0] ? distro : "");
     }
 
@@ -1440,7 +1481,6 @@ int main(int argc,char** argv){
     // Populate file combo with recent files
     for(auto& r:g_recent_files) win->inp_file->add(r.c_str());
     if(win->inp_file->size()>1) { win->inp_file->value(0); win->cur_file=win->inp_file->text(0); win->refresh_file_info(win->cur_file); }
-    // win->log("DediProg Linux GUI  —  V1.14.21.x natively integrated");
     win->log("Connect your SF100/SF600 via USB, then click Detect.");
     // Permanent 50ms timer drives Cancel button enable/disable via g_running
     Fl::add_timeout(0.05, MainWindow::progress_timer_cb, win);

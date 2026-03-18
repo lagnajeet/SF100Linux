@@ -16,19 +16,14 @@ LDFLAGS  := $(shell fltk-config --ldflags) \
 
 # ── macOS extras ──────────────────────────────────────────────────────────────
 ifeq ($(UNAME), Darwin)
-    LDFLAGS    += -framework IOKit -framework CoreFoundation -framework Cocoa
-    EXTRA_OBJS  = build/mac_filepicker.o
-    SF_OBJS_LINK_EXTRA =
-else
-    EXTRA_OBJS  =
+    LDFLAGS += -framework IOKit -framework CoreFoundation
 endif
 
 SF_NAMES := FlashCommand IntelHexFile MotorolaFile SerialFlash board parse project usbdriver dpcmd
 SF_OBJS  := $(patsubst %, build/sf_%.o, $(SF_NAMES))
 
 # ── On Linux: rename parse.c's openChipInfoDb so dpgui.cpp's override takes
-#    precedence. On macOS: parse.c has a native _NSGetExecutablePath version,
-#    no rename needed.
+#    precedence. On macOS: parse.c has a native _NSGetExecutablePath version.
 ifeq ($(UNAME), Darwin)
     SF_OBJS_LINK := $(SF_OBJS)
 else
@@ -49,15 +44,11 @@ build/sf_%.o: $(SFDIR)/%.c | build
 build/dpgui.o: dpgui.cpp | build
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# macOS only: compile Objective-C++ file for native file picker
-build/mac_filepicker.o: mac_filepicker.mm | build
-	$(CXX) $(CXXFLAGS) -fobjc-arc -c $< -o $@
-
 # Linux only: rename symbol in parse.o
 build/sf_parse_wrapped.o: build/sf_parse.o
 	objcopy --redefine-sym openChipInfoDb=openChipInfoDb_orig $< $@
 
-dpgui: $(SF_OBJS_LINK) build/dpgui.o $(EXTRA_OBJS)
+dpgui: $(SF_OBJS_LINK) build/dpgui.o
 	$(CXX) $^ -o $@ $(LDFLAGS)
 	@echo ""
 	@echo "  Build successful: ./dpgui"

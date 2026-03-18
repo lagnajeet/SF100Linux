@@ -19,6 +19,7 @@
 #include <FL/Fl_Text_Display.H>
 #include <FL/Fl_Text_Buffer.H>
 #include <FL/Fl_File_Chooser.H>
+#include <FL/Fl_Native_File_Chooser.H>
 #include <FL/Fl_Group.H>
 #include <FL/Fl_Check_Button.H>
 #include <FL/Fl_Select_Browser.H>
@@ -372,11 +373,6 @@ static std::string show_chip_select_dialog(
 
 // Forward declaration (defined later with native file picker)
 static std::string native_pick(const char* title, const char* glob, bool save);
-#ifdef __APPLE__
-// Declared in mac_filepicker.mm
-std::string mac_pick_open(const char* title, const char* glob);
-std::string mac_pick_save(const char* title);
-#endif
 
 // ── Recent files ──────────────────────────────────────────────────────────────
 static const int RECENT_MAX = 10;
@@ -613,54 +609,31 @@ static int               g_marquee_tick = 0;       // drives progress bar animat
 
 // ── Native file picker ────────────────────────────────────────────────────────
 static std::string native_pick(const char* title, const char* glob, bool save=false) {
-    char cmd[2048];
-
-#ifdef __APPLE__
-    // macOS: native Cocoa NSOpenPanel / NSSavePanel
-    if (!save) return mac_pick_open(title, glob);
-    else       return mac_pick_save(title);
-
-#else
-    // Linux: try zenity then kdialog
-    if (!save)
-        snprintf(cmd,sizeof(cmd),
-            "zenity --file-selection --title='%s' "
-            "--file-filter='Firmware files | %s' 2>/dev/null", title, glob);
-    else
-        snprintf(cmd,sizeof(cmd),
-            "zenity --file-selection --save --confirm-overwrite "
-            "--title='%s' 2>/dev/null", title);
-    FILE* p=popen(cmd,"r");
-    if (p) {
-        char buf[4096]={};
-        bool ok = (fgets(buf,sizeof(buf),p) != nullptr);
-        int rc = pclose(p);
-        if (ok && rc==0 && buf[0]) {
-            buf[strcspn(buf,"\n")]=0; return buf;
+    // Uses Fl_Native_File_Chooser: GTK dialog on Linux, Cocoa on macOS
+    // No external tools (zenity/kdialog) or Objective-C needed
+    Fl_Native_File_Chooser fc;
+    fc.title(title);
+    fc.type(save ? Fl_Native_File_Chooser::BROWSE_SAVE_FILE
+                 : Fl_Native_File_Chooser::BROWSE_FILE);
+    if (!save) {
+        // Filter format: "Label\t*.{ext1,ext2,...}\n"
+        // Convert space-separated "*.bin *.hex" to brace list "*.{bin,hex}"
+        std::string exts;
+        char tmp[512]; strncpy(tmp, glob, sizeof(tmp)-1);
+        char* tok = strtok(tmp, " ");
+        while (tok) {
+            const char* dot = strchr(tok, '.');
+            if (dot && *(dot+1)) {
+                if (!exts.empty()) exts += ",";
+                exts += (dot+1);
+            }
+            tok = strtok(nullptr, " ");
         }
+        std::string filter = "Firmware Files\t*.{" + exts + "}\n";
+        fc.filter(filter.c_str());
     }
-    if (!save)
-        snprintf(cmd,sizeof(cmd),
-            "kdialog --getopenfilename . '%s' --title '%s' 2>/dev/null",glob,title);
-    else
-        snprintf(cmd,sizeof(cmd),
-            "kdialog --getsavefilename . '*.bin' --title '%s' 2>/dev/null",title);
-    p=popen(cmd,"r");
-    if (p) {
-        char buf[4096]={};
-        bool ok = (fgets(buf,sizeof(buf),p) != nullptr);
-        int rc = pclose(p);
-        if (ok && rc==0 && buf[0]) {
-            buf[strcspn(buf,"\n")]=0; return buf;
-        }
-    }
-#endif
-
-    // FLTK fallback (both platforms)
-    int mode = save ? Fl_File_Chooser::CREATE : Fl_File_Chooser::SINGLE;
-    Fl_File_Chooser fc(".", (std::string(glob)+" files ("+glob+")").c_str(), mode, title);
-    fc.show(); while(fc.shown()) Fl::wait();
-    if (fc.count()>0 && fc.value(1)) return fc.value(1);
+    if (fc.show() == 0 && fc.filename())
+        return fc.filename();
     return "";
 }
 

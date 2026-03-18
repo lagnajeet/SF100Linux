@@ -703,9 +703,93 @@ public:
 
         // ── Header (full width) ───────────────────────────────────────────────
         Fl_Box* hb=new Fl_Box(0,0,W,34); hb->box(FL_FLAT_BOX); hb->color(COL_HEADER);
-        Fl_Box* ht=new Fl_Box(12,4,W-24,26,"DediProg  SF100/SF600  GUI");
+        Fl_Box* ht=new Fl_Box(12,4,W-100,26,"DediProg  SF100/SF600  GUI");
         ht->labelcolor(FL_WHITE); ht->labelfont(FL_HELVETICA_BOLD);
         ht->labelsize(14); ht->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE);
+        // About button — top right of header
+        Fl_Button* btn_about = new Fl_Button(W-90,4,82,26,"About");
+        btn_about->box(FL_FLAT_BOX);
+        btn_about->color(COL_HEADER);
+        btn_about->labelcolor(fl_rgb_color(0xAA,0xCC,0xFF));
+        btn_about->labelfont(FL_HELVETICA);
+        btn_about->labelsize(12);
+        btn_about->callback([](Fl_Widget*,void*){
+            const int DW=440, DH=310, PAD=16;
+            Fl_Window* dlg = new Fl_Window(DW, DH, "About DediProg GUI");
+            dlg->begin();
+
+            int y = PAD;
+
+            // App name
+            Fl_Box* name = new Fl_Box(PAD, y, DW-PAD*2, 28, "DediProg SF100/SF600 GUI  v1.0");
+            name->labelfont(FL_HELVETICA_BOLD); name->labelsize(14);
+            name->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE);
+            y += 32;
+
+            // Description
+            Fl_Box* desc = new Fl_Box(PAD, y, DW-PAD*2, 90,
+                "A native cross-platform GUI for DediProg SF100/SF600\n"
+                "SPI NOR flash programmers, built on SF100Linux V1.14.21.x.\n"
+                "Supports chip detection, programming, verification,\n"
+                "erasing, blank check and read operations with\n"
+                "real-time progress tracking.");
+            desc->labelsize(12);
+            desc->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE|FL_ALIGN_TOP);
+            y += 96;
+
+            // Developer info
+            Fl_Box* dev = new Fl_Box(PAD, y, DW-PAD*2, 20, "Developer:  Lagnajeet Pradhan");
+            dev->labelsize(12); dev->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE);
+            y += 22;
+
+            // Email link
+            Fl_Button* email = new Fl_Button(PAD, y, DW-PAD*2, 20, "");
+            email->box(FL_NO_BOX);
+            email->labelsize(12); email->labelcolor(fl_rgb_color(0x00,0x55,0xBB));
+            email->labelfont(FL_HELVETICA); email->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE);
+            email->copy_label("Email:      lagnajeet@@gmail.com");
+            email->callback([](Fl_Widget*,void*){
+#ifdef __APPLE__
+                system("open mailto:lagnajeet@gmail.com");
+#else
+                system("xdg-open mailto:lagnajeet@gmail.com &");
+#endif
+            }, nullptr);
+            y += 22;
+
+            // GitHub link
+            Fl_Button* gh = new Fl_Button(PAD, y, DW-PAD*2, 20, "GitHub:     https://github.com/lagnajeet");
+            gh->box(FL_NO_BOX);
+            gh->labelsize(12); gh->labelcolor(fl_rgb_color(0x00,0x55,0xBB));
+            gh->labelfont(FL_HELVETICA); gh->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE);
+            gh->callback([](Fl_Widget*,void*){
+#ifdef __APPLE__
+                system("open https://github.com/lagnajeet");
+#else
+                system("xdg-open https://github.com/lagnajeet &");
+#endif
+            }, nullptr);
+            y += 30;
+
+            // Footer
+            Fl_Box* foot = new Fl_Box(PAD, y, DW-PAD*2, 36,
+                "Built with FLTK and libusb.\n"
+                "SF100Linux courtesy of DediProg Software Co., Ltd.");
+            foot->labelsize(11); foot->labelcolor(fl_rgb_color(0x66,0x66,0x66));
+            foot->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE|FL_ALIGN_TOP);
+            y += 42;
+
+            // Close button
+            Fl_Button* ok = new Fl_Button(DW/2-40, y, 80, 26, "Close");
+            ok->callback([](Fl_Widget*,void* dlgv){ ((Fl_Window*)dlgv)->hide(); }, dlg);
+
+            dlg->callback([](Fl_Widget* w,void*){ w->hide(); });
+            dlg->end();
+            dlg->set_modal();
+            dlg->show();
+            while (dlg->shown()) Fl::wait();
+            delete dlg;
+        }, nullptr);
         int y=38;
 
         // ── Controls — full width ─────────────────────────────────────────────
@@ -727,7 +811,7 @@ public:
         chk_erase->value(1); chk_verify->value(1); y+=32;
 
         // Operation buttons — full width
-        static const char* labels[]={"Detect","Blank","Erase","Program","Verify","Read","Cancel"};
+        static const char* labels[]={"Detect","Blank Check","Erase","Program","Verify","Read","Cancel"};
         Fl_Button** btns[]={&btn_detect,&btn_blank,&btn_erase,
                             &btn_prog,&btn_verify,&btn_read,&btn_cancel};
         Fl_Callback* cbs[]={cb_detect,cb_blank,cb_erase,

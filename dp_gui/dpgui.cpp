@@ -156,6 +156,24 @@ static Fl_Color COL_PANEL_HDR = COL_PANEL_HDR_LIGHT;
 static Fl_Color COL_PANEL_BG  = COL_PANEL_BG_LIGHT;
 static Fl_Color COL_BLUE_VAL  = COL_BLUE_VAL_LIGHT;
 
+// Centre a dialog over the main window
+static void center_over_parent(Fl_Window* dlg) {
+    // Find the largest visible window (the main window) as parent
+    Fl_Window* parent = nullptr;
+    int max_area = 0;
+    for (Fl_Window* w = Fl::first_window(); w; w = Fl::next_window(w)) {
+        if (w == dlg) continue;
+        int area = w->w() * w->h();
+        if (area > max_area) { max_area = area; parent = w; }
+    }
+    if (!parent) parent = Fl::first_window();
+    if (parent && parent != dlg) {
+        int px = parent->x() + (parent->w() - dlg->w()) / 2;
+        int py = parent->y() + (parent->h() - dlg->h()) / 2;
+        dlg->position(px, py);
+    }
+}
+
 // ── Chip DB parser ────────────────────────────────────────────────────────────
 // On macOS openChipInfoDb is defined in parse.c (uses _NSGetExecutablePath)
 #ifdef __APPLE__
@@ -378,6 +396,7 @@ static std::string show_chip_select_dialog(
 
     dlg->end();
     dlg->set_modal();
+    center_over_parent(dlg);
     dlg->show();
     while (dlg->shown()) Fl::wait();
     delete dlg;
@@ -385,6 +404,7 @@ static std::string show_chip_select_dialog(
     return s_result;
 }
 
+// Centre a dialog over the parent window before showing
 // Forward declaration (defined later with native file picker)
 static std::string native_pick(const char* title, const char* glob, bool save);
 
@@ -607,6 +627,7 @@ static bool show_load_file_dialog(std::string& out_path,
 
     dlg->end();
     dlg->set_modal();
+    center_over_parent(dlg);
     dlg->show();
     while (dlg->shown()) Fl::wait();
     delete dlg;
@@ -848,6 +869,7 @@ public:
             dlg->callback([](Fl_Widget* w,void*){ w->hide(); });
             dlg->end();
             dlg->set_modal();
+            center_over_parent(dlg);
             dlg->show();
             while (dlg->shown()) Fl::wait();
             delete dlg;
@@ -1535,8 +1557,12 @@ public:
         ((MainWindow*)v)->run_async("Blank Check",[](){g_ucOperation=BLANK;});
     }
     static void cb_erase(Fl_Widget*,void* v){
+        auto* w=(MainWindow*)v;
+        if(g_running.load()){fl_alert("Operation in progress.");return;}
+        if(!g_usb_open&&!w->init_usb()){fl_alert("Programmer not connected.");return;}
+        if(!g_chip_selected){fl_alert("No chip selected.\nClick Detect first.");return;}
         if(fl_choice("Erase the whole chip?","Cancel","Erase",nullptr)!=1)return;
-        ((MainWindow*)v)->run_async("Erase",[](){g_ucOperation=ERASE;});
+        w->run_async("Erase",[](){g_ucOperation=ERASE;});
     }
     static void cb_prog(Fl_Widget*,void* v){
         auto* w=(MainWindow*)v;
@@ -1619,6 +1645,9 @@ public:
     }
     static void cb_read(Fl_Widget*,void* v){
         auto* w=(MainWindow*)v;
+        if(g_running.load()){fl_alert("Operation in progress.");return;}
+        if(!g_usb_open&&!w->init_usb()){fl_alert("Programmer not connected.");return;}
+        if(!g_chip_selected){fl_alert("No chip selected.\nClick Detect first.");return;}
         std::string path=native_pick("Save Read Output As","*.bin",true);
         if(path.empty())return;
         static std::string sp; sp=path;

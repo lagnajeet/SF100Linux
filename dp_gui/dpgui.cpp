@@ -34,6 +34,8 @@
 #include <FL/fl_draw.H>
 
 #include <cstdio>
+#include <sys/file.h>
+#include <fcntl.h>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -635,6 +637,7 @@ static bool show_load_file_dialog(std::string& out_path,
     dlg->end();
     dlg->set_modal();
     center_over_parent(dlg);
+    dlg->position(dlg->x(), std::max(0, dlg->y() - 100));
     dlg->show();
     while (dlg->shown()) Fl::wait();
     delete dlg;
@@ -1331,14 +1334,20 @@ public:
         char tp[4096]; strncpy(tp,path.c_str(),sizeof(tp)-1);
         InfoPanel::set(inf_fn, basename(tp));
         struct stat st;
-        if(stat(path.c_str(),&st)==0){
-            char tmp[128];
-            snprintf(tmp,sizeof(tmp),"0x%lX",(unsigned long)st.st_size);
-            InfoPanel::set(inf_fsz, tmp);
-            struct tm* t=localtime(&st.st_mtime);
-            strftime(tmp,sizeof(tmp),"%Y-%m-%d %H:%M",t);
-            InfoPanel::set(inf_fmod, tmp);
+        if(stat(path.c_str(),&st)!=0){
+            // File doesn't exist — show name but mark rest as not found
+            InfoPanel::set(inf_fsz,  "Not found");
+            InfoPanel::set(inf_fmod, "Not found");
+            InfoPanel::set(inf_fcrc, "Not found");
+            InfoPanel::set(inf_fck,  "Not found");
+            return;
         }
+        char tmp[128];
+        snprintf(tmp,sizeof(tmp),"0x%lX",(unsigned long)st.st_size);
+        InfoPanel::set(inf_fsz, tmp);
+        struct tm* t=localtime(&st.st_mtime);
+        strftime(tmp,sizeof(tmp),"%Y-%m-%d %H:%M",t);
+        InfoPanel::set(inf_fmod, tmp);
         // CRC32 + byte checksum
         FILE* f=fopen(path.c_str(),"rb");
         if(f){
@@ -1833,7 +1842,25 @@ static void probe_gtk() {
 }
 #endif
 
+static bool single_instance_check() {
+    int fd = open("/tmp/dpgui.lock", O_CREAT | O_RDWR, 0666);
+    if (fd < 0) return true;
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0)
+        return true; // first instance, lock held
+    // Another instance running -- raise it
+    close(fd);
+#ifdef __APPLE__
+    system("osascript -e 'tell app \"System Events\" to set frontmost"
+           " of (first process whose name contains \"dpgui\") to true'"           " 2>/dev/null");
+#else
+    if (system("wmctrl -a \"DediProg\" 2>/dev/null") != 0)
+        system("xdotool search --name \"DediProg\" windowactivate 2>/dev/null");
+#endif
+    return false;
+}
+
 int main(int argc,char** argv){
+    if (!single_instance_check()) return 0;
     Fl::lock();
 #ifndef __APPLE__
     probe_gtk();

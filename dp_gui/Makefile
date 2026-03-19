@@ -10,20 +10,37 @@ UNAME := $(shell uname)
 # ── Compiler flags ────────────────────────────────────────────────────────────
 CFLAGS   := -O2 -Wall -I$(SFDIR) $(shell pkg-config --cflags libusb-1.0)
 CXXFLAGS := $(CFLAGS) -std=c++11 $(shell fltk-config --cxxflags)
-LDFLAGS  := $(shell fltk-config --ldflags) \
-            $(shell pkg-config --libs libusb-1.0) \
-            -lpthread
 
-# ── macOS extras ──────────────────────────────────────────────────────────────
+# ── Link flags ────────────────────────────────────────────────────────────────
+# STATIC=1: statically link FLTK + X11, keep libusb/libc dynamic.
+# On Ubuntu build machine first run:
+#   sudo apt-get install libxcursor-dev libxft-dev libxfixes-dev libxinerama-dev
+ifdef STATIC
+    # Link only libfltk.a statically; let everything else remain dynamic.
+    # This avoids the deep static dependency chain (freetype, xcb, expat etc.)
+    FLTK_A   := $(shell fltk-config --ldstaticflags | awk '{print $$1}')
+    LDFLAGS  := -Wl,-Bstatic $(FLTK_A) -Wl,-Bdynamic \
+                -lXrender -lXcursor -lXfixes -lXext -lXft -lXinerama \
+                -lfontconfig -lX11 \
+                $(shell pkg-config --libs libusb-1.0) \
+                -lpthread -lm -ldl
+else
+    LDFLAGS  := $(shell fltk-config --ldflags) \
+                $(shell pkg-config --libs libusb-1.0) \
+                -lpthread
+endif
+
+# ── macOS: always dynamic, add frameworks ─────────────────────────────────────
 ifeq ($(UNAME), Darwin)
-    LDFLAGS += -framework IOKit -framework CoreFoundation
+    LDFLAGS  := $(shell fltk-config --ldflags) \
+                $(shell pkg-config --libs libusb-1.0) \
+                -lpthread \
+                -framework IOKit -framework CoreFoundation
 endif
 
 SF_NAMES := FlashCommand IntelHexFile MotorolaFile SerialFlash board parse project usbdriver dpcmd
 SF_OBJS  := $(patsubst %, build/sf_%.o, $(SF_NAMES))
 
-# ── On Linux: rename parse.c's openChipInfoDb so dpgui.cpp's override takes
-#    precedence. On macOS: parse.c has a native _NSGetExecutablePath version.
 ifeq ($(UNAME), Darwin)
     SF_OBJS_LINK := $(SF_OBJS)
 else
@@ -44,14 +61,19 @@ build/sf_%.o: $(SFDIR)/%.c | build
 build/dpgui.o: dpgui.cpp | build
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# Linux only: rename symbol in parse.o
 build/sf_parse_wrapped.o: build/sf_parse.o
 	objcopy --redefine-sym openChipInfoDb=openChipInfoDb_orig $< $@
 
 dpgui: $(SF_OBJS_LINK) build/dpgui.o
 	$(CXX) $^ -o $@ $(LDFLAGS)
 	@echo ""
+ifdef STATIC
+	@echo "  Build successful (static FLTK): ./dpgui"
+	@echo "  No libfltk needed on target — only libusb-1.0 required"
+else
 	@echo "  Build successful: ./dpgui"
+	@echo "  Tip: 'make STATIC=1' for a portable binary (no libfltk on target)"
+endif
 ifeq ($(UNAME), Darwin)
 	@echo "  macOS: make sure ChipInfoDb.dedicfg is next to the binary"
 else

@@ -20,6 +20,9 @@
 #include <FL/Fl_Text_Buffer.H>
 #include <FL/Fl_File_Chooser.H>
 #include <FL/Fl_Native_File_Chooser.H>
+#ifndef __APPLE__
+#include <FL/x.H>  // fl_xid() for X11 window ID
+#endif
 #include <FL/Fl_Group.H>
 #include <FL/Fl_Check_Button.H>
 #include <FL/Fl_Select_Browser.H>
@@ -672,32 +675,101 @@ static int               g_marquee_tick = 0;       // drives progress bar animat
 
 // ── Native file picker ────────────────────────────────────────────────────────
 static std::string native_pick(const char* title, const char* glob, bool save=false) {
-    // Uses Fl_Native_File_Chooser: GTK dialog on Linux, Cocoa on macOS
-    // No external tools (zenity/kdialog) or Objective-C needed
+    char cmd[2048];
+
+#ifdef __APPLE__
+    // macOS: Fl_Native_File_Chooser uses Cocoa natively
+    (void)cmd;
     Fl_Native_File_Chooser fc;
     fc.title(title);
     fc.type(save ? Fl_Native_File_Chooser::BROWSE_SAVE_FILE
                  : Fl_Native_File_Chooser::BROWSE_FILE);
     if (!save) {
-        // Filter format: "Label\t*.{ext1,ext2,...}\n"
-        // Convert space-separated "*.bin *.hex" to brace list "*.{bin,hex}"
         std::string exts;
         char tmp[512]; strncpy(tmp, glob, sizeof(tmp)-1);
         char* tok = strtok(tmp, " ");
         while (tok) {
             const char* dot = strchr(tok, '.');
-            if (dot && *(dot+1)) {
-                if (!exts.empty()) exts += ",";
-                exts += (dot+1);
-            }
+            if (dot && *(dot+1)) { if (!exts.empty()) exts += ","; exts += (dot+1); }
             tok = strtok(nullptr, " ");
         }
         std::string filter = "Firmware Files\t*.{" + exts + "}\n";
         fc.filter(filter.c_str());
     }
-    if (fc.show() == 0 && fc.filename())
-        return fc.filename();
+    if (fc.show() == 0 && fc.filename()) return fc.filename();
     return "";
+
+#else
+    // Linux: zenity -> kdialog -> Fl_Native_File_Chooser fallback
+    // Get main window X11 ID for --attach (centres and makes modal)
+    unsigned long xwin = 0;
+    if (Fl_Window* mw = Fl::first_window()) xwin = fl_xid(mw);
+
+    if (!save)
+        snprintf(cmd, sizeof(cmd),
+            "zenity --file-selection --modal"
+            " --title='%s'"
+            " --file-filter='Firmware Files | %s'"
+            " --file-filter='All Files | *'"
+            "%s"
+            " 2>/dev/null",
+            title, glob,
+            xwin ? (std::string(" --attach=") + std::to_string(xwin)).c_str() : "");
+    else
+        snprintf(cmd, sizeof(cmd),
+            "zenity --file-selection --save --confirm-overwrite --modal"
+            " --title='%s'"
+            "%s"
+            " 2>/dev/null",
+            title,
+            xwin ? (std::string(" --attach=") + std::to_string(xwin)).c_str() : "");
+    FILE* p = popen(cmd, "r");
+    if (p) {
+        char buf[4096] = {};
+        bool got = (fgets(buf, sizeof(buf), p) != nullptr);
+        int rc = pclose(p);
+        if (rc != 127) {
+            if (got && buf[0]) { buf[strcspn(buf,"\n")]=0; return buf; }
+            return "";
+        }
+    }
+    // kdialog (KDE)
+    if (!save)
+        snprintf(cmd, sizeof(cmd),
+            "kdialog --getopenfilename . '%s' --title '%s' 2>/dev/null", glob, title);
+    else
+        snprintf(cmd, sizeof(cmd),
+            "kdialog --getsavefilename . '*.bin' --title '%s' 2>/dev/null", title);
+    p = popen(cmd, "r");
+    if (p) {
+        char buf[4096] = {};
+        bool got = (fgets(buf, sizeof(buf), p) != nullptr);
+        int rc = pclose(p);
+        if (rc != 127) {
+            if (got && buf[0]) { buf[strcspn(buf,"\n")]=0; return buf; }
+            return "";
+        }
+    }
+    // Fallback: Fl_Native_File_Chooser
+    Fl_Native_File_Chooser fc;
+    fc.title(title);
+    fc.type(save ? Fl_Native_File_Chooser::BROWSE_SAVE_FILE
+                 : Fl_Native_File_Chooser::BROWSE_FILE);
+    if (!save) {
+        std::string exts;
+        char tmp[512]; strncpy(tmp, glob, sizeof(tmp)-1);
+        char* tok = strtok(tmp, " ");
+        while (tok) {
+            const char* dot = strchr(tok, '.');
+            if (dot && *(dot+1)) { if (!exts.empty()) exts += ","; exts += (dot+1); }
+            tok = strtok(nullptr, " ");
+        }
+        std::string filter = "Firmware Files\t*.{" + exts + "}\n";
+        fc.filter(filter.c_str());
+    }
+    if (fc.show() == 0 && fc.filename()) return fc.filename();
+    return "";
+#endif
 }
 
 // ── InfoPanel ─────────────────────────────────────────────────────────────────
@@ -1729,6 +1801,16 @@ int main(int argc,char** argv){
     Fl::background(0xF0,0xF0,0xF0);
     Fl::background2(0xFF,0xFF,0xFF);
     Fl::foreground(0x22,0x22,0x22);
+    // Explicitly enable GTK native file chooser.
+    // On some distros (Fedora/RHEL) libs are in /lib64 which dlopen may not
+    // search by default — hint via LD_LIBRARY_PATH if not already set.
+    Fl::option(Fl::OPTION_FNFC_USES_GTK, true);
+    {
+        const char* ldp = getenv("LD_LIBRARY_PATH");
+        std::string newldp = "/usr/lib64:/lib64";
+        if (ldp && *ldp) newldp += std::string(":") + ldp;
+        setenv("LD_LIBRARY_PATH", newldp.c_str(), 1);
+    }
     recent_load();
     int px=100,py=100,pw=1100,ph=680;
     prefs_load(px,py,pw,ph,g_dark_mode);

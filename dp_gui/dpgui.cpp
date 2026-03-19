@@ -764,6 +764,9 @@ public:
             g_dark_mode = !g_dark_mode;
             wb->copy_label(g_dark_mode ? "Light Mode" : "Dark Mode");
             apply_theme(g_dark_mode);
+            // Directly update checkboxes via MainWindow pointer
+            MainWindow* mw = (MainWindow*)v;
+            Fl_Color tick = g_dark_mode ? fl_rgb_color(0x4F,0xC3,0xF7) : fl_rgb_color(0x00,0x55,0xBB);
         }, this);
         // About button — top right of header
         Fl_Button* btn_about = new Fl_Button(W-90,4,82,26,"About");
@@ -1630,8 +1633,9 @@ public:
 static void apply_theme(bool dark) {
     if (dark) {
         Fl::background (0x1E,0x1E,0x1E);
-        Fl::background2(0x25,0x25,0x26);
+        Fl::background2(0x3C,0x3C,0x3F); // lighter than window bg so checkbox is visible
         Fl::foreground (0xD4,0xD4,0xD4);
+        Fl::set_color(FL_SELECTION_COLOR, 0x4F,0xC3,0xF7); // light blue tick
         COL_HEADER    = COL_HEADER_DARK;
         COL_PANEL_HDR = COL_PANEL_HDR_DARK;
         COL_PANEL_BG  = COL_PANEL_BG_DARK;
@@ -1640,6 +1644,7 @@ static void apply_theme(bool dark) {
         Fl::background (0xF0,0xF0,0xF0);
         Fl::background2(0xFF,0xFF,0xFF);
         Fl::foreground (0x22,0x22,0x22);
+        Fl::set_color(FL_SELECTION_COLOR, 0x00,0x55,0xBB); // restore default blue
         COL_HEADER    = COL_HEADER_LIGHT;
         COL_PANEL_HDR = COL_PANEL_HDR_LIGHT;
         COL_PANEL_BG  = COL_PANEL_BG_LIGHT;

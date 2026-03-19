@@ -21,7 +21,8 @@
 #include <FL/Fl_File_Chooser.H>
 #include <FL/Fl_Native_File_Chooser.H>
 #ifndef __APPLE__
-#include <FL/x.H>  // fl_xid() for X11 window ID
+#include <FL/x.H>   // fl_xid() for X11 window ID
+#include <dlfcn.h>  // dlopen() for GTK probe
 #endif
 #include <FL/Fl_Group.H>
 #include <FL/Fl_Check_Button.H>
@@ -151,7 +152,10 @@ extern "C" {
 #define COL_PANEL_BG_DARK   fl_rgb_color(0x25,0x25,0x26)
 #define COL_BLUE_VAL_DARK   fl_rgb_color(0x4F,0xC3,0xF7)
 
-static bool g_dark_mode = false;
+static bool g_dark_mode    = false;
+#ifndef __APPLE__
+static bool g_gtk_available = false;
+#endif
 
 // Active theme colours (set by apply_theme)
 static Fl_Color COL_HEADER    = COL_HEADER_LIGHT;
@@ -700,11 +704,34 @@ static std::string native_pick(const char* title, const char* glob, bool save=fa
     return "";
 
 #else
-    // Linux: zenity -> kdialog -> Fl_Native_File_Chooser fallback
-    // Get main window X11 ID for --attach (centres and makes modal)
+    // Linux: use Fl_Native_File_Chooser if GTK available (true modal),
+    // otherwise zenity -> kdialog -> FLTK fallback.
     unsigned long xwin = 0;
-    if (Fl_Window* mw = Fl::first_window()) xwin = fl_xid(mw);
+    Fl_Window* mw = Fl::first_window();
+    if (mw) xwin = fl_xid(mw);
 
+    if (g_gtk_available) {
+        Fl_Native_File_Chooser fc;
+        fc.title(title);
+        fc.type(save ? Fl_Native_File_Chooser::BROWSE_SAVE_FILE
+                     : Fl_Native_File_Chooser::BROWSE_FILE);
+        if (!save) {
+            std::string exts;
+            char etmp[512]; strncpy(etmp, glob, sizeof(etmp)-1);
+            char* etok = strtok(etmp, " ");
+            while (etok) {
+                const char* dot = strchr(etok, '.');
+                if (dot && *(dot+1)) { if (!exts.empty()) exts += ","; exts += (dot+1); }
+                etok = strtok(nullptr, " ");
+            }
+            std::string filter = "Firmware Files\t*.{" + exts + "}\n";
+            fc.filter(filter.c_str());
+        }
+        if (fc.show() == 0 && fc.filename()) return fc.filename();
+        return "";
+    }
+
+    // GTK not available: zenity -> kdialog -> FLTK
     if (!save)
         snprintf(cmd, sizeof(cmd),
             "zenity --file-selection --modal"
@@ -728,12 +755,14 @@ static std::string native_pick(const char* title, const char* glob, bool save=fa
         char buf[4096] = {};
         bool got = (fgets(buf, sizeof(buf), p) != nullptr);
         int rc = pclose(p);
+        if (mw) { mw->activate(); Fl::check(); }
         if (rc != 127) {
             if (got && buf[0]) { buf[strcspn(buf,"\n")]=0; return buf; }
             return "";
         }
-    }
+    } else { if (mw) { mw->activate(); Fl::check(); } }
     // kdialog (KDE)
+    if (mw) { mw->deactivate(); Fl::check(); }
     if (!save)
         snprintf(cmd, sizeof(cmd),
             "kdialog --getopenfilename . '%s' --title '%s' 2>/dev/null", glob, title);
@@ -1795,8 +1824,20 @@ static void apply_theme(bool dark) {
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
+#ifndef __APPLE__
+static void probe_gtk() {
+    void* h = dlopen("libgtk-3.so.0", RTLD_LAZY | RTLD_NOLOAD);
+    if (!h) h = dlopen("libgtk-3.so.0", RTLD_LAZY);
+    g_gtk_available = (h != nullptr);
+    if (h) dlclose(h);
+}
+#endif
+
 int main(int argc,char** argv){
     Fl::lock();
+#ifndef __APPLE__
+    probe_gtk();
+#endif
     Fl::scheme("gtk+");
     Fl::background(0xF0,0xF0,0xF0);
     Fl::background2(0xFF,0xFF,0xFF);

@@ -27,7 +27,7 @@ ifdef STATIC
 else
     LDFLAGS  := $(shell fltk-config --ldflags) \
                 $(shell pkg-config --libs libusb-1.0) \
-                -lpthread
+                -lpthread -ldl
 endif
 
 # ── macOS: always dynamic, add frameworks ─────────────────────────────────────

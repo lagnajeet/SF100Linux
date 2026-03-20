@@ -35,6 +35,7 @@
 
 #include <cstdio>
 #include <sys/file.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <cstdlib>
 #include <cstring>
@@ -664,16 +665,18 @@ static void capture_start() {
     fcntl(g_pipe_rd,F_SETFL,O_NONBLOCK);
     g_saved_stdout=dup(STDOUT_FILENO);
     dup2(g_pipe_wr,STDOUT_FILENO); fflush(stdout);
-    // Set unbuffered so library printf() reaches the pipe immediately
-    setvbuf(stdout, nullptr, _IONBF, 0);
+    // Line-buffered: flushes on every \n so status lines appear immediately
+    // but \r elapsed-time noise is buffered, preventing pipe overflow on macOS
+    setvbuf(stdout, nullptr, _IOLBF, 4096);
     g_pipe_buf.clear();
 }
 static void capture_stop() {
     fflush(stdout);
-    dup2(g_saved_stdout,STDOUT_FILENO);
-    setvbuf(stdout, nullptr, _IOLBF, 0); // restore line buffering
-    close(g_saved_stdout); g_saved_stdout=-1;
-    close(g_pipe_wr);      g_pipe_wr=-1;
+    if (g_saved_stdout >= 0) {
+        dup2(g_saved_stdout, STDOUT_FILENO);
+        close(g_saved_stdout); g_saved_stdout = -1;
+    }
+    if (g_pipe_wr >= 0) { close(g_pipe_wr); g_pipe_wr = -1; }
 }
 
 // ── Shared state ──────────────────────────────────────────────────────────────
@@ -1201,7 +1204,22 @@ public:
     }
     void set_status(const char* s){ lbl_status->copy_label(s); lbl_status->redraw(); }
     void set_ui_busy(bool busy) {
-        // During an op: disable all controls except Cancel
+        // On macOS FLTK 1.4, activate()/deactivate() triggers AppKit's
+        // _NSMenuShortcutUpdater which crashes if called rapidly in succession.
+        // Instead we just visually dim the buttons — clicks are already blocked
+        // by the g_running.load() check at the start of each callback.
+#ifdef __APPLE__
+        Fl_Color dim = fl_rgb_color(0x88,0x88,0x88);
+        Fl_Color normal = FL_FOREGROUND_COLOR;
+        Fl_Color c = busy ? dim : normal;
+        btn_detect->labelcolor(c); btn_blank->labelcolor(c);
+        btn_erase->labelcolor(c);  btn_prog->labelcolor(c);
+        btn_verify->labelcolor(c); btn_read->labelcolor(c);
+        btn_browse->labelcolor(c); cho_clk->labelcolor(c);
+        chk_erase->labelcolor(c);  chk_verify->labelcolor(c);
+        inp_file->labelcolor(c);
+        redraw();
+#else
         if (busy) {
             btn_detect->deactivate(); btn_blank->deactivate();
             btn_erase->deactivate();  btn_prog->deactivate();
@@ -1217,6 +1235,7 @@ public:
             cho_clk->activate();      chk_erase->activate();
             chk_verify->activate();
         }
+#endif
     }
     // Real progress: shows "N%" with colour that flips at 50% so it
     // is always readable against either the filled or unfilled bar.
@@ -1318,13 +1337,15 @@ public:
 
     // ── Drain remaining pipe after op ─────────────────────────────────────────
     void drain_and_stop() {
-        char buf[4096]; ssize_t n;
-        while((n=read(g_pipe_rd,buf,sizeof(buf)-1))>0){
-            buf[n]='\0';
-            process_pipe_chunk(buf,n);
+        if (g_pipe_rd >= 0) {
+            char buf[4096]; ssize_t n;
+            while((n=read(g_pipe_rd,buf,sizeof(buf)-1))>0){
+                buf[n]='\0';
+                process_pipe_chunk(buf,n);
+            }
         }
         capture_stop();
-        close(g_pipe_rd); g_pipe_rd=-1;
+        if (g_pipe_rd >= 0) { close(g_pipe_rd); g_pipe_rd=-1; }
     }
 
     // ── File info ─────────────────────────────────────────────────────────────
@@ -1502,19 +1523,38 @@ public:
         std::thread([this,name,done](){
             int r=Handler(); bool ok=(r==EXCODE_PASS);
             fflush(stdout);
-            Fl::lock();
-            Fl::remove_timeout(pipe_timer_cb,    this);
-        // (progress_timer_cb runs permanently from main)
-            drain_and_stop();
-            set_progress(100);
-            set_ui_busy(false);
-            // code: 0=PASS 1=USB 2=ERASE 3=PROG 4=VERIFY 5=LFWV 6=READ 7=BLANK 8=BATCH 9=CSUM 10=IDENTIFY 11=FW 12=OTHER
-            log(ok ? ("✓  "+name+" OK") : ("✗  "+name+" FAILED (code "+std::to_string(r)+")"));
-            set_status(ok?(name+" OK").c_str():(name+" FAILED").c_str());
-            refresh_prog_info(); refresh_mem_info();
-            g_running=false;
-            if(done) done(ok);
-            Fl::unlock(); Fl::awake();
+            // Close pipe write end first so pipe_timer_cb sees EOF
+            // and stops reading. Do NOT hold Fl::lock() during drain
+            // to avoid deadlock with pipe_timer_cb on the main thread.
+            capture_stop(); // closes pipe_wr, restores stdout
+            // Small yield to let pipe_timer_cb drain remaining data
+            // and exit on its own before we remove it
+            struct timespec ts={0,20000000}; nanosleep(&ts,nullptr);
+            struct AsyncDone {
+                MainWindow* w; std::string name;
+                bool ok; int r;
+                std::function<void(bool)> done;
+            };
+            auto* ad = new AsyncDone{this, name, ok, r, done};
+            Fl::awake([](void* ud){
+                // Runs on main thread -- safe for AppKit and UI ops
+                auto* ad = (AsyncDone*)ud;
+                Fl::remove_timeout(pipe_timer_cb, ad->w);
+                ad->w->drain_and_stop(); // drain any remaining pipe data
+                ad->w->set_progress(100);
+                ad->w->set_ui_busy(false);
+                ad->w->log(ad->ok
+                    ? ("✓  "+ad->name+" OK")
+                    : ("✗  "+ad->name+" FAILED (code "+std::to_string(ad->r)+")"));
+                ad->w->set_status(ad->ok
+                    ? (ad->name+" OK").c_str()
+                    : (ad->name+" FAILED").c_str());
+                ad->w->refresh_prog_info();
+                ad->w->refresh_mem_info();
+                g_running = false;
+                if (ad->done) ad->done(ad->ok);
+                delete ad;
+            }, ad);
         }).detach();
     }
 
@@ -1864,6 +1904,7 @@ static bool single_instance_check() {
 
 int main(int argc,char** argv){
     if (!single_instance_check()) return 0;
+    signal(SIGPIPE, SIG_IGN); // prevent crash if pipe write end closes unexpectedly
     Fl::lock();
 #ifndef __APPLE__
     probe_gtk();

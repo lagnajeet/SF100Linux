@@ -659,6 +659,8 @@ static bool show_load_file_dialog(std::string& out_path,
 static int g_pipe_rd=-1, g_pipe_wr=-1, g_saved_stdout=-1;
 static std::string g_pipe_buf;  // accumulates bytes between \r/\n delimiters
 
+static std::atomic<bool> g_pipe_active{false}; // controls pipe_timer_cb
+
 static void capture_start() {
     int fds[2]; pipe(fds);
     g_pipe_rd=fds[0]; g_pipe_wr=fds[1];
@@ -671,6 +673,7 @@ static void capture_start() {
     g_pipe_buf.clear();
 }
 static void capture_stop() {
+    g_pipe_active = false; // stop pipe_timer_cb from repeating
     fflush(stdout);
     if (g_saved_stdout >= 0) {
         dup2(g_saved_stdout, STDOUT_FILENO);
@@ -1204,22 +1207,6 @@ public:
     }
     void set_status(const char* s){ lbl_status->copy_label(s); lbl_status->redraw(); }
     void set_ui_busy(bool busy) {
-        // On macOS FLTK 1.4, activate()/deactivate() triggers AppKit's
-        // _NSMenuShortcutUpdater which crashes if called rapidly in succession.
-        // Instead we just visually dim the buttons — clicks are already blocked
-        // by the g_running.load() check at the start of each callback.
-#ifdef __APPLE__
-        Fl_Color dim = fl_rgb_color(0x88,0x88,0x88);
-        Fl_Color normal = FL_FOREGROUND_COLOR;
-        Fl_Color c = busy ? dim : normal;
-        btn_detect->labelcolor(c); btn_blank->labelcolor(c);
-        btn_erase->labelcolor(c);  btn_prog->labelcolor(c);
-        btn_verify->labelcolor(c); btn_read->labelcolor(c);
-        btn_browse->labelcolor(c); cho_clk->labelcolor(c);
-        chk_erase->labelcolor(c);  chk_verify->labelcolor(c);
-        inp_file->labelcolor(c);
-        redraw();
-#else
         if (busy) {
             btn_detect->deactivate(); btn_blank->deactivate();
             btn_erase->deactivate();  btn_prog->deactivate();
@@ -1235,6 +1222,11 @@ public:
             cho_clk->activate();      chk_erase->activate();
             chk_verify->activate();
         }
+#ifdef __APPLE__
+        // macOS FLTK 1.4: flush immediately after widget state changes so
+        // AppKit processes all _NSMenuShortcutUpdater events in one batch
+        // before the next run loop iteration schedules more.
+        Fl::flush();
 #endif
     }
     // Real progress: shows "N%" with colour that flips at 50% so it
@@ -1295,12 +1287,14 @@ public:
     // ── Pipe timer — drains stdout only, no progress logic ───────────────────
     static void pipe_timer_cb(void* v) {
         auto* w=(MainWindow*)v;
-        char buf[4096]; ssize_t n;
-        while((n=read(g_pipe_rd,buf,sizeof(buf)-1))>0){
-            buf[n]='\0';
-            w->process_pipe_chunk(buf,n);
+        if (g_pipe_rd >= 0) {
+            char buf[4096]; ssize_t n;
+            while((n=read(g_pipe_rd,buf,sizeof(buf)-1))>0){
+                buf[n]='\0';
+                w->process_pipe_chunk(buf,n);
+            }
         }
-        if(g_running.load()) Fl::repeat_timeout(0.05, pipe_timer_cb, v);
+        if(g_pipe_active.load()) Fl::repeat_timeout(0.05, pipe_timer_cb, v);
     }
 
     // ── Progress timer — polls g_sf_progress from the worker thread ──────────
@@ -1311,9 +1305,14 @@ public:
         auto* w = (MainWindow*)v;
         bool running = g_running.load();
 
-        // Keep cancel button in sync with running state (safe: timer runs in main thread)
-        if (running) w->btn_cancel->activate();
-        else         w->btn_cancel->deactivate();
+        // Only toggle cancel button when state changes to avoid
+        // AppKit _NSMenuShortcutUpdater crash on macOS FLTK 1.4
+        static bool last_running = false;
+        if (running != last_running) {
+            last_running = running;
+            if (running) w->btn_cancel->activate();
+            else         w->btn_cancel->deactivate();
+        }
 
         if (running) {
             size_t done  = g_sf_progress.done;
@@ -1516,6 +1515,7 @@ public:
         g_marquee_tick  = 0;       // marquee fallback counter (used when total==0)
         g_sf_progress.done  = 0;   // reset real progress counters
         g_sf_progress.total = 0;
+        g_pipe_active = true;
         capture_start();
         Fl::add_timeout(0.05, pipe_timer_cb,    this);
         // (progress_timer_cb runs permanently from main)
@@ -1529,7 +1529,7 @@ public:
             capture_stop(); // closes pipe_wr, restores stdout
             // Small yield to let pipe_timer_cb drain remaining data
             // and exit on its own before we remove it
-            struct timespec ts={0,20000000}; nanosleep(&ts,nullptr);
+            struct timespec ts={0,100000000}; nanosleep(&ts,nullptr); // 100ms
             struct AsyncDone {
                 MainWindow* w; std::string name;
                 bool ok; int r;
@@ -1540,7 +1540,17 @@ public:
                 // Runs on main thread -- safe for AppKit and UI ops
                 auto* ad = (AsyncDone*)ud;
                 Fl::remove_timeout(pipe_timer_cb, ad->w);
-                ad->w->drain_and_stop(); // drain any remaining pipe data
+                // Drain any remaining pipe data then close read end
+                if (g_pipe_rd >= 0) {
+                    // Ensure non-blocking before drain
+                    fcntl(g_pipe_rd, F_SETFL, O_NONBLOCK);
+                    char buf[4096]; ssize_t n;
+                    while((n=read(g_pipe_rd,buf,sizeof(buf)-1))>0){
+                        buf[n]='\0';
+                        ad->w->process_pipe_chunk(buf,n);
+                    }
+                    close(g_pipe_rd); g_pipe_rd=-1;
+                }
                 ad->w->set_progress(100);
                 ad->w->set_ui_busy(false);
                 ad->w->log(ad->ok
@@ -1755,6 +1765,7 @@ public:
         g_marquee_tick=0;
         g_sf_progress.done  = 0;
         g_sf_progress.total = 0;
+        g_pipe_active = true;
         capture_start();
         Fl::add_timeout(0.05, pipe_timer_cb,    w);
         // (progress_timer_cb runs permanently from main)
@@ -1768,17 +1779,31 @@ public:
 
             int r=Handler(); bool ok=(r==EXCODE_PASS);
             fflush(stdout);
-            Fl::lock();
-            Fl::remove_timeout(pipe_timer_cb,    w);
-        // (progress_timer_cb runs permanently from main)
-            w->drain_and_stop();
-            w->set_progress(100);
-            w->set_ui_busy(false);
-            w->log(ok ? "✓  Verify OK" : ("✗  Verify FAILED (code "+std::to_string(r)+")"));
-            w->set_status(ok ? "Verify OK" : "Verify FAILED");
-            w->refresh_prog_info(); w->refresh_mem_info();
-            g_running=false;
-            Fl::unlock(); Fl::awake();
+            capture_stop();
+            struct timespec ts={0,100000000}; nanosleep(&ts,nullptr);
+            struct VDone { MainWindow* w; bool ok; int r; };
+            auto* vd = new VDone{w, ok, r};
+            Fl::awake([](void* ud){
+                auto* vd = (VDone*)ud;
+                Fl::remove_timeout(pipe_timer_cb, vd->w);
+                if (g_pipe_rd >= 0) {
+                    fcntl(g_pipe_rd, F_SETFL, O_NONBLOCK);
+                    char buf[4096]; ssize_t n;
+                    while((n=read(g_pipe_rd,buf,sizeof(buf)-1))>0){
+                        buf[n]='\0';
+                        vd->w->process_pipe_chunk(buf,n);
+                    }
+                    close(g_pipe_rd); g_pipe_rd=-1;
+                }
+                vd->w->set_progress(100);
+                vd->w->set_ui_busy(false);
+                vd->w->log(vd->ok ? "✓  Verify OK"
+                    : ("✗  Verify FAILED (code "+std::to_string(vd->r)+")"));
+                vd->w->set_status(vd->ok ? "Verify OK" : "Verify FAILED");
+                vd->w->refresh_prog_info(); vd->w->refresh_mem_info();
+                g_running=false;
+                delete vd;
+            }, vd);
         }).detach();
     }
     static void cb_cancel(Fl_Widget*,void* v){

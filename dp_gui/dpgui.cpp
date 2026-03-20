@@ -664,11 +664,14 @@ static void capture_start() {
     fcntl(g_pipe_rd,F_SETFL,O_NONBLOCK);
     g_saved_stdout=dup(STDOUT_FILENO);
     dup2(g_pipe_wr,STDOUT_FILENO); fflush(stdout);
+    // Set unbuffered so library printf() reaches the pipe immediately
+    setvbuf(stdout, nullptr, _IONBF, 0);
     g_pipe_buf.clear();
 }
 static void capture_stop() {
     fflush(stdout);
     dup2(g_saved_stdout,STDOUT_FILENO);
+    setvbuf(stdout, nullptr, _IOLBF, 0); // restore line buffering
     close(g_saved_stdout); g_saved_stdout=-1;
     close(g_pipe_wr);      g_pipe_wr=-1;
 }

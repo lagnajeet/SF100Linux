@@ -193,11 +193,11 @@ dylibbundler -od -b \
 
 | Programmer | Status |
 |------------|--------|
-| SF600Plus | ✅ |
-| SF600Plus-G2 | ✅ |
-| SF600 | ✅ |
-| SF700 | ✅ |
-| SF100 | ✅ |
+| SF600Plus | ✅ Tested |
+| SF600Plus-G2 | ⚠️ Expected to work (untested) |
+| SF600 | ⚠️ Expected to work (untested) |
+| SF700 | ⚠️ Expected to work (untested) |
+| SF100 | ⚠️ Expected to work (untested) |
 
 ---
 

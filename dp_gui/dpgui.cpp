@@ -1928,6 +1928,64 @@ static bool single_instance_check() {
 }
 
 int main(int argc,char** argv){
+    // -- --test-chipdb [filter] -------------------------------------------
+    // Parse ChipInfoDb.dedicfg and print results without launching the GUI.
+    // Usage:
+    //   ./dpgui --test-chipdb              -- print all chips + summary
+    //   ./dpgui --test-chipdb W25Q         -- filter by name
+    //   ./dpgui --test-chipdb --mfr Winbond -- filter by manufacturer
+    if (argc >= 2 && strcmp(argv[1], "--test-chipdb") == 0) {
+        const char* filter     = nullptr;
+        bool        filter_mfr = false;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--mfr") == 0 && i+1 < argc) {
+                filter_mfr = true;
+                filter = argv[++i];
+            } else {
+                filter = argv[i];
+            }
+        }
+        printf("Parsing ChipInfoDb.dedicfg...\n");
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        auto chips = parse_chip_db();
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ms = (t1.tv_sec  - t0.tv_sec )*1000.0
+                  + (t1.tv_nsec - t0.tv_nsec)/1e6;
+        if (chips.empty()) {
+            fprintf(stderr, "ERROR: No chips parsed. Check ChipInfoDb.dedicfg path.\n");
+            return 1;
+        }
+        // Apply optional filter (case-insensitive)
+        std::vector<ChipEntry> results;
+        if (filter) {
+            std::string f = filter;
+            for (auto& ch : f) ch = tolower((unsigned char)ch);
+            for (auto& chip : chips) {
+                std::string hay = filter_mfr ? chip.manufacturer : chip.name;
+                for (auto& ch : hay) ch = tolower((unsigned char)ch);
+                if (hay.find(f) != std::string::npos)
+                    results.push_back(chip);
+            }
+        } else {
+            results = chips;
+        }
+        // Print results
+        for (int i = 0; i < (int)results.size(); i++)
+            printf("[%4d] %-40s %s\n", i+1,
+                results[i].name.c_str(),
+                results[i].manufacturer.c_str());
+        printf("\n");
+        printf("Total chips in DB : %zu\n", chips.size());
+        if (filter)
+            printf("Matching '%s'%s: %zu\n", filter,
+                filter_mfr ? " (manufacturer)" : "",
+                results.size());
+        printf("Parse time        : %.1f ms\n", ms);
+        printf("OK\n");
+        return 0;
+    }
+
     if (!single_instance_check()) return 0;
     signal(SIGPIPE, SIG_IGN); // prevent crash if pipe write end closes unexpectedly
     Fl::lock();

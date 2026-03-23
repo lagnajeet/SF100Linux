@@ -26,7 +26,7 @@ Supports Linux and macOS with a clean, professional interface.
 
 ## Features
 
-- **Chip Detection** — auto-detects from a database of 1900+ SPI NOR flash chips
+- **Chip Detection** — auto-detects from a database of 1700+ SPI NOR flash chips
 - **Operations** — Program, Verify, Erase, Blank Check, Read
 - **Real-time logging** — per-phase progress (Erasing → Programming → Verifying)
 - **Progress bar** — real percentage during program/verify, marquee during erase

@@ -193,51 +193,70 @@ extern "C" FILE* openChipInfoDb(void);
 // a flat list of {TypeName, Manufacturer} for every SPI NOR chip entry.
 struct ChipEntry { std::string name, manufacturer; };
 
+// Parses ChipInfoDb.dedicfg and returns {TypeName, Manufacturer} for every
+// SPI NOR chip. Handles:
+//   - UTF-8 (current DB format, no BOM)
+//   - UTF-16LE with BOM (0xFF 0xFE) -- older DB versions
+//   - Multi-line <Chip .../> entries (each attribute on its own line)
+//   - Long lines (no fixed buffer limit -- uses std::string)
+//   - CRLF and LF line endings
 static std::vector<ChipEntry> parse_chip_db() {
     std::vector<ChipEntry> chips;
     FILE* fp = openChipInfoDb();
     if (!fp) return chips;
 
-    // File is UTF-16LE. Read entire file then extract ASCII chars (strip nulls).
+    // Read entire file into memory
     fseek(fp, 0, SEEK_END);
     long sz = ftell(fp);
     fseek(fp, 0, SEEK_SET);
-    std::vector<char> raw(sz+1, 0);
-    fread(raw.data(), 1, sz, fp);
+    std::string text(sz, '\0');
+    fread(&text[0], 1, sz, fp);
     fclose(fp);
 
-    // Strip null bytes to get ASCII-compatible text
-    std::string text;
-    text.reserve(sz);
-    for (long i = 0; i < sz; i++)
-        if (raw[i] != '\0') text += raw[i];
+    // Detect and convert UTF-16LE (BOM: 0xFF 0xFE)
+    if (sz >= 2 &&
+        (unsigned char)text[0] == 0xFF && (unsigned char)text[1] == 0xFE) {
+        std::string utf8;
+        utf8.reserve(sz / 2);
+        for (long i = 2; i+1 < sz; i += 2) {
+            uint16_t cp = (uint8_t)text[i] | ((uint8_t)text[i+1] << 8);
+            if (cp < 0x80) {
+                utf8 += (char)cp;
+            } else if (cp < 0x800) {
+                utf8 += (char)(0xC0 | (cp >> 6));
+                utf8 += (char)(0x80 | (cp & 0x3F));
+            } else {
+                utf8 += (char)(0xE0 | (cp >> 12));
+                utf8 += (char)(0x80 | ((cp >> 6) & 0x3F));
+                utf8 += (char)(0x80 | (cp & 0x3F));
+            }
+        }
+        text = std::move(utf8);
+    }
 
-    // Walk through <Chip ...> blocks extracting TypeName and Manufacturer
+    // Extract attribute value from a chip block string
+    auto attr = [](const std::string& block, const char* key) -> std::string {
+        std::string pat = std::string(key) + "=\"";
+        size_t a = block.find(pat);
+        if (a == std::string::npos) return "";
+        a += pat.size();
+        size_t b = block.find('"', a);
+        if (b == std::string::npos) return "";
+        return block.substr(a, b - a);
+    };
+
+    // Scan for <Chip blocks -- each spans multiple lines until "/>")
     size_t pos = 0;
     while ((pos = text.find("<Chip ", pos)) != std::string::npos) {
-        // Find end of this chip element (ends at "/>")
         size_t end = text.find("/>", pos);
         if (end == std::string::npos) break;
         std::string block = text.substr(pos, end - pos + 2);
         pos = end + 2;
 
-        // Helper: extract attribute value from block
-        auto attr = [&](const std::string& key) -> std::string {
-            std::string pat = key + "=\"";
-            size_t a = block.find(pat);
-            if (a == std::string::npos) return "";
-            a += pat.size();
-            size_t b = block.find('"', a);
-            if (b == std::string::npos) return "";
-            return block.substr(a, b - a);
-        };
+        if (attr(block, "ICType") != "SPI_NOR") continue;
 
-        // Only include SPI NOR chips (same filter as Windows dialog "SPI NOR" type)
-        std::string ictype = attr("ICType");
-        if (ictype != "SPI_NOR") continue;
-
-        std::string name = attr("TypeName");
-        std::string mfr  = attr("Manufacturer");
+        std::string name = attr(block, "TypeName");
+        std::string mfr  = attr(block, "Manufacturer");
         if (name.empty()) continue;
         chips.push_back({name, mfr});
     }

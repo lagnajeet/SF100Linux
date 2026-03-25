@@ -426,8 +426,17 @@ static const char* RECENT_PATH = nullptr; // set at startup
 static std::string recent_file_path() {
     const char* home = getenv("HOME");
     static std::string p;
-    if (home) p = std::string(home) + "/.config/dpgui_recent";
-    else p = "/tmp/dpgui_recent";
+    if (home) {
+#ifdef __APPLE__
+        // macOS 15+: use ~/Library/Application Support/dpgui/
+        // ~/.config is not reliably writable for Finder-launched apps
+        p = std::string(home) + "/Library/Application Support/dpgui";
+        mkdir(p.c_str(), 0755);
+        p += "/dpgui_recent";
+#else
+        p = std::string(home) + "/.config/dpgui_recent";
+#endif
+    } else p = "/tmp/dpgui_recent";
     return p;
 }
 
@@ -461,8 +470,15 @@ static void recent_add(const std::string& path) {
 static std::string prefs_path() {
     const char* home = getenv("HOME");
     static std::string p;
-    if (home) p = std::string(home) + "/.config/dpgui_prefs";
-    else p = "/tmp/dpgui_prefs";
+    if (home) {
+#ifdef __APPLE__
+        p = std::string(home) + "/Library/Application Support/dpgui";
+        mkdir(p.c_str(), 0755);
+        p += "/dpgui_prefs";
+#else
+        p = std::string(home) + "/.config/dpgui_prefs";
+#endif
+    } else p = "/tmp/dpgui_prefs";
     return p;
 }
 static void prefs_save(int x, int y, int w, int h, bool dark) {

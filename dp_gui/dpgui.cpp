@@ -1972,6 +1972,7 @@ int main(int argc,char** argv){
     win->size_range(900,560,0,0);
     win->position(px,py);
     win->show(argc,argv);
+    Fl::focus(win->log_disp); // default focus on log, not buttons
     // Populate file combo with recent files
     for(auto& r:g_recent_files) win->inp_file->add(r.c_str());
     if(win->inp_file->size()>1) { win->inp_file->value(0); win->cur_file=win->inp_file->text(0); win->refresh_file_info(win->cur_file); }

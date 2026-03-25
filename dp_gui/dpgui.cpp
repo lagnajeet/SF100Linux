@@ -1224,6 +1224,7 @@ public:
     void set_status(const char* s){ lbl_status->copy_label(s); lbl_status->redraw(); }
     void set_ui_busy(bool busy) {
         if (busy) {
+            Fl::focus(log_disp);
             btn_detect->deactivate(); btn_blank->deactivate();
             btn_erase->deactivate();  btn_prog->deactivate();
             btn_verify->deactivate(); btn_read->deactivate();

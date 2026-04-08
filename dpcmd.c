@@ -15,6 +15,21 @@
 #endif
 #include <sys/stat.h>
 #include <sys/time.h>
+#ifdef _WIN32
+/* gettimeofday and timersub are not available on Windows */
+/* gettimeofday available in MSYS2 */
+#ifndef timersub
+#define timersub(a, b, result) \
+    do { \
+        (result)->tv_sec  = (a)->tv_sec  - (b)->tv_sec;  \
+        (result)->tv_usec = (a)->tv_usec - (b)->tv_usec; \
+        if ((result)->tv_usec < 0) { \
+            (result)->tv_sec--;  \
+            (result)->tv_usec += 1000000; \
+        } \
+    } while (0)
+#endif
+#endif
 #include <sys/types.h>
 #include <time.h>
 #define min(a, b) (a > b ? b : a)
@@ -406,11 +421,20 @@ void print_message_function(void* ptr)
 void GetLogPath(char* pBuf)
 {
     memset(pBuf, 0, 512);
+#ifdef _WIN32
+    if (GetModuleFileNameA(NULL, pBuf, 512) != 0) {
+        // Replace executable name with log.txt
+        char* sep = strrchr(pBuf, '\\');
+        if (sep) *(sep + 1) = '\0';
+        if (strlen(pBuf) < (511 - sizeof("log.txt")))
+            strcat(pBuf, "log.txt");
+    }
+#else
     if (readlink("/proc/self/exe", pBuf, 512) != -1) {
         if (strlen(pBuf) < (511 - sizeof("/log.txt")))
             strcat(pBuf, "/log.txt");
-        //		printf("%s\n",pBuf);
     }
+#endif
 }
 
 void EnterStandaloneMode(int Index)
@@ -1658,7 +1682,7 @@ void do_DisplayOrSave(void)
                     }
                 }
 
-                if (WriteFile((const char*)SourceStr, pBufferForLastReadData[icnt], UploadAddrRange.length) == 1)
+                if (DP_WriteFile((const char*)SourceStr, pBufferForLastReadData[icnt], UploadAddrRange.length) == 1)
                     printf("\nSuccessfully saved into file:%s \n", SourceStr);
                 else
                     printf("\nFailed to save into file: %s\n", SourceStr);
@@ -1677,7 +1701,7 @@ void do_DisplayOrSave(void)
             printf("\n\n");
         } else {
             UploadAddrRange.length = UploadAddrRange.end - UploadAddrRange.start;
-            if (WriteFile((const char*)g_parameter_read, pBufferForLastReadData[g_uiDevNum - 1], UploadAddrRange.length) == 1)
+            if (DP_WriteFile((const char*)g_parameter_read, pBufferForLastReadData[g_uiDevNum - 1], UploadAddrRange.length) == 1)
                 printf("\nSuccessfully saved into file:%s \n", g_parameter_read);
             else
                 printf("\nFailed to save into file: %s\n", g_parameter_read);

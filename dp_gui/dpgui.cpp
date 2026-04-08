@@ -21,8 +21,11 @@
 #include <FL/Fl_File_Chooser.H>
 #include <FL/Fl_Native_File_Chooser.H>
 #ifndef __APPLE__
+#ifndef _WIN32
 #include <FL/x.H>   // fl_xid() for X11 window ID
 #include <dlfcn.h>  // dlopen() for GTK probe
+#include <sys/file.h>  // flock()
+#endif
 #endif
 #include <FL/Fl_Group.H>
 #include <FL/Fl_Check_Button.H>
@@ -36,6 +39,16 @@
 #include <cstdio>
 #include <sys/file.h>
 #include <signal.h>
+#ifdef _WIN32
+#include <io.h>      // _pipe, _dup, _dup2, _read, _close
+#include <fcntl.h>   // O_BINARY
+#include <direct.h>  // _mkdir
+#endif
+#ifdef _WIN32
+#include <winsock2.h>  // for timeval on Windows
+#include <windows.h>
+#include <FL/x.H>
+#endif
 #include <fcntl.h>
 #include <cstdlib>
 #include <cstring>
@@ -50,7 +63,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#ifndef _WIN32
 #include <sys/utsname.h>
+#endif
 #include <libgen.h>
 #include <time.h>
 #include <algorithm>
@@ -60,7 +75,7 @@
 // ── Override openChipInfoDb (Linux only) ─────────────────────────────────────
 // On macOS, parse.c already has a native _NSGetExecutablePath implementation
 // that finds the DB next to the binary — no override needed.
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(_WIN32)
 extern "C" FILE* openChipInfoDb_orig(void);
 extern "C" FILE* openChipInfoDb(void) {
     if (FILE* f = openChipInfoDb_orig()) return f;
@@ -80,7 +95,7 @@ extern "C" FILE* openChipInfoDb(void) {
     fprintf(stderr, "Error: ChipInfoDb.dedicfg not found.\n");
     return nullptr;
 }
-#endif // __APPLE__
+#endif // !__APPLE__ && !_WIN32
 
 // ── SF100Linux C API ──────────────────────────────────────────────────────────
 extern "C" {
@@ -185,8 +200,8 @@ static void center_over_parent(Fl_Window* dlg) {
 }
 
 // ── Chip DB parser ────────────────────────────────────────────────────────────
-// On macOS openChipInfoDb is defined in parse.c (uses _NSGetExecutablePath)
-#ifdef __APPLE__
+// openChipInfoDb is defined in parse.c on macOS and Windows
+#if defined(__APPLE__) || defined(_WIN32)
 extern "C" FILE* openChipInfoDb(void);
 #endif
 // Parses ChipInfoDb.dedicfg (XML, UTF-16LE with CRLF line endings) and returns
@@ -424,8 +439,16 @@ static std::vector<std::string> g_recent_files;
 static const char* RECENT_PATH = nullptr; // set at startup
 
 static std::string recent_file_path() {
-    const char* home = getenv("HOME");
     static std::string p;
+#ifdef _WIN32
+    {
+        const char* appdata = getenv("APPDATA");
+        std::string dir = appdata ? std::string(appdata) + "\\dpgui" : "C:\\dpgui";
+        _mkdir(dir.c_str());
+        p = dir + "\\dpgui_recent";
+    }
+#else
+    const char* home = getenv("HOME");
     if (home) {
 #ifdef __APPLE__
         // macOS 15+: use ~/Library/Application Support/dpgui/
@@ -436,7 +459,8 @@ static std::string recent_file_path() {
 #else
         p = std::string(home) + "/.config/dpgui_recent";
 #endif
-    } else p = "/tmp/dpgui_recent";
+    } else p = std::string(getenv("TEMP") ? getenv("TEMP") : "C:\\Temp") + "\\dpgui_recent";
+#endif // _WIN32
     return p;
 }
 
@@ -467,9 +491,49 @@ static void recent_add(const std::string& path) {
     fclose(f);
 }
 
+// Escape path for Fl_Choice: only / @ & need escaping (FLTK special chars)
+// We replace / with the Unicode lookalike ∕ for display,
+// and store the real path separately in cur_file.
+// Simpler approach: just replace / with a placeholder FLTK won't interpret
+static std::string fltk_escape(const std::string& s) {
+    // FLTK uses \ as escape char and / as submenu separator.
+    // Double all backslashes and escape forward slashes.
+    std::string out;
+    out.reserve(s.size() * 2);
+    for (char ch : s) {
+        if (ch == '\\') { out += "\\\\"; } // \ -> \\
+        else if (ch == '/') { out += "\\/"; }  // / -> \/
+        else if (ch == '@') { out += "\\@"; }  // @ -> \@
+        else if (ch == '&') { out += "\\&"; }  // & -> \&
+        else { out += ch; }
+    }
+    return out;
+}
+
+static std::string fltk_unescape(const std::string& s) {
+    std::string r;
+    r.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '\\' && i+1 < s.size()) {
+            r += s[++i]; // consume escape, keep next char as-is
+        } else {
+            r += s[i];
+        }
+    }
+    return r;
+}
+
 static std::string prefs_path() {
-    const char* home = getenv("HOME");
     static std::string p;
+#ifdef _WIN32
+    {
+        const char* appdata = getenv("APPDATA");
+        std::string dir = appdata ? std::string(appdata) + "\\dpgui" : "C:\\dpgui";
+        _mkdir(dir.c_str());
+        p = dir + "\\dpgui_prefs";
+    }
+#else
+    const char* home = getenv("HOME");
     if (home) {
 #ifdef __APPLE__
         p = std::string(home) + "/Library/Application Support/dpgui";
@@ -478,7 +542,8 @@ static std::string prefs_path() {
 #else
         p = std::string(home) + "/.config/dpgui_prefs";
 #endif
-    } else p = "/tmp/dpgui_prefs";
+    } else p = std::string(getenv("TEMP") ? getenv("TEMP") : "C:\\Temp") + "\\dpgui_prefs";
+#endif // _WIN32
     return p;
 }
 static void prefs_save(int x, int y, int w, int h, bool dark) {
@@ -523,14 +588,19 @@ static bool load_file_with_format(const char* path, FileFormat fmt) {
     char lnk[256];
     snprintf(lnk, sizeof(lnk), "/tmp/dpgui_fmt_override%s", ext);
     unlink(lnk);
+#ifdef _WIN32
+    // symlink not available on Windows -- use original path directly
+    ok = LoadFile(const_cast<char*>(path));
+#else
     if (symlink(path, lnk) == 0) {
         ok = LoadFile(lnk);
         unlink(lnk);
     } else {
-        // symlink failed (e.g. cross-device) — fall back
+        // symlink failed -- fall back
         char buf[4096]; strncpy(buf, path, sizeof(buf)-1);
         ok = LoadFile(buf);
     }
+#endif
     return ok;
 }
 
@@ -562,13 +632,13 @@ static bool show_load_file_dialog(std::string& out_path,
     Fl_Choice* cho_path = new Fl_Choice(PAD+76, y, DW-PAD-76-80-PAD, 26);
     cho_path->textsize(11);
     // Populate with recent files
-    for (auto& r : g_recent_files) cho_path->add(r.c_str());
+    for (auto& r : g_recent_files) cho_path->add(fltk_escape(r).c_str());
     if (!s_path.empty()) {
         // If current path isn't in list add it temporarily at top
         bool found = false;
         for (int i = 0; i < cho_path->size()-1; i++)
             if (std::string(cho_path->text(i)) == s_path) { cho_path->value(i); found=true; break; }
-        if (!found) { cho_path->insert(0, s_path.c_str(), 0, nullptr); cho_path->value(0); }
+        if (!found) { cho_path->insert(0, fltk_escape(s_path).c_str(), 0, nullptr); cho_path->value(0); }
     } else if (cho_path->size() > 1) {
         cho_path->value(0);
     }
@@ -578,6 +648,7 @@ static bool show_load_file_dialog(std::string& out_path,
         Fl_Choice* c = (Fl_Choice*)ud;
         std::string p = native_pick("Select File",
             "*.bin *.hex *.img *.s19 *.srec *.mot *.rom", false);
+        p=fltk_escape(p);
         if (!p.empty()) {
             bool found = false;
             for (int i = 0; i < c->size()-1; i++)
@@ -678,24 +749,52 @@ static std::string g_pipe_buf;  // accumulates bytes between \r/\n delimiters
 static std::atomic<bool> g_pipe_active{false}; // controls pipe_timer_cb
 
 static void capture_start() {
+#ifdef _WIN32
+    // When launched without a console (e.g. double-click), stdout
+    // fileno is -2 (invalid). Reopen to NUL first to get valid handle.
+    if (_fileno(stdout) < 0)
+        freopen("NUL", "w", stdout);
+    int fds[2]; _pipe(fds, 65536, O_BINARY);
+    g_pipe_rd=fds[0]; g_pipe_wr=fds[1];
+    // Windows pipes are always blocking -- use PeekNamedPipe in read loop
+#else
     int fds[2]; pipe(fds);
     g_pipe_rd=fds[0]; g_pipe_wr=fds[1];
     fcntl(g_pipe_rd,F_SETFL,O_NONBLOCK);
+#endif
+#ifdef _WIN32
+    g_saved_stdout=_dup(_fileno(stdout));
+    _dup2(g_pipe_wr,_fileno(stdout)); fflush(stdout);
+#else
     g_saved_stdout=dup(STDOUT_FILENO);
     dup2(g_pipe_wr,STDOUT_FILENO); fflush(stdout);
-    // Line-buffered: flushes on every \n so status lines appear immediately
-    // but \r elapsed-time noise is buffered, preventing pipe overflow on macOS
+#endif
+    // Line-buffered on Linux/macOS; unbuffered on Windows (_IOLBF not supported)
+#ifdef _WIN32
+    setvbuf(stdout, nullptr, _IONBF, 0);
+#else
     setvbuf(stdout, nullptr, _IOLBF, 4096);
+#endif
     g_pipe_buf.clear();
 }
 static void capture_stop() {
     g_pipe_active = false; // stop pipe_timer_cb from repeating
     fflush(stdout);
     if (g_saved_stdout >= 0) {
+#ifdef _WIN32
+        _dup2(g_saved_stdout, _fileno(stdout));
+        _close(g_saved_stdout);
+#else
         dup2(g_saved_stdout, STDOUT_FILENO);
-        close(g_saved_stdout); g_saved_stdout = -1;
+        close(g_saved_stdout);
+#endif
+        g_saved_stdout = -1;
     }
+#ifdef _WIN32
+    if (g_pipe_wr >= 0) { _close(g_pipe_wr); g_pipe_wr = -1; }
+#else
     if (g_pipe_wr >= 0) { close(g_pipe_wr); g_pipe_wr = -1; }
+#endif
 }
 
 // ── Shared state ──────────────────────────────────────────────────────────────
@@ -709,7 +808,33 @@ static int               g_marquee_tick = 0;       // drives progress bar animat
 static std::string native_pick(const char* title, const char* glob, bool save=false) {
     char cmd[2048];
 
-#ifdef __APPLE__
+#ifdef _WIN32
+    // Windows: Fl_Native_File_Chooser uses Win32 GetOpenFileName natively
+    (void)cmd;
+    Fl_Native_File_Chooser fc;
+    fc.title(title);
+    fc.type(save ? Fl_Native_File_Chooser::BROWSE_SAVE_FILE
+                 : Fl_Native_File_Chooser::BROWSE_FILE);
+    if (!save) {
+        std::string exts;
+        char tmp[512]; strncpy(tmp, glob, sizeof(tmp)-1);
+        char* tok = strtok(tmp, " ");
+        while (tok) {
+            const char* dot = strchr(tok, '.');
+            if (dot && *(dot+1)) { if (!exts.empty()) exts += ","; exts += (dot+1); }
+            tok = strtok(nullptr, " ");
+        }
+        std::string filter = "Firmware Files\t*.{" + exts + "}\n";
+        fc.filter(filter.c_str());
+    }
+    if (fc.show() == 0 && fc.filename()) 
+    {
+        // printf("Selected file: %s\n", fc.filename());
+        return fc.filename();
+    }
+    return "";
+
+#elif defined(__APPLE__)
     // macOS: Fl_Native_File_Chooser uses Cocoa natively
     (void)cmd;
     Fl_Native_File_Chooser fc;
@@ -736,7 +861,9 @@ static std::string native_pick(const char* title, const char* glob, bool save=fa
     // otherwise zenity -> kdialog -> FLTK fallback.
     unsigned long xwin = 0;
     Fl_Window* mw = Fl::first_window();
+#ifndef _WIN32
     if (mw) xwin = fl_xid(mw);
+#endif
 
     if (g_gtk_available) {
         Fl_Native_File_Chooser fc;
@@ -961,7 +1088,9 @@ public:
             email->labelfont(FL_HELVETICA); email->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE);
             email->copy_label("Email:      lagnajeet@@gmail.com");
             email->callback([](Fl_Widget*,void*){
-#ifdef __APPLE__
+#ifdef _WIN32
+                ShellExecuteA(NULL,"open","mailto:lagnajeet@gmail.com",NULL,NULL,SW_SHOWNORMAL);
+#elif defined(__APPLE__)
                 system("open mailto:lagnajeet@gmail.com");
 #else
                 system("xdg-open mailto:lagnajeet@gmail.com &");
@@ -975,7 +1104,9 @@ public:
             gh->labelsize(12); gh->labelcolor(fl_rgb_color(0x00,0x55,0xBB));
             gh->labelfont(FL_HELVETICA); gh->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE);
             gh->callback([](Fl_Widget*,void*){
-#ifdef __APPLE__
+#ifdef _WIN32
+                ShellExecuteA(NULL,"open","https://github.com/lagnajeet",NULL,NULL,SW_SHOWNORMAL);
+#elif defined(__APPLE__)
                 system("open https://github.com/lagnajeet");
 #else
                 system("xdg-open https://github.com/lagnajeet &");
@@ -1142,42 +1273,63 @@ public:
         end();
 
         // Fill OS info: distro name + kernel version
-        struct utsname u; uname(&u);
-        char kernel_str[128];
-        snprintf(kernel_str, sizeof(kernel_str), "%s %s", u.sysname, u.release);
-        InfoPanel::set(inf_os_kernel, kernel_str);
+        char kernel_str[128] = "";
         char distro[128] = "";
-#ifdef __APPLE__
-        // macOS: use sw_vers to get product name and version
+#ifdef _WIN32
         {
+            snprintf(distro, sizeof(distro), "Windows");
+
+            OSVERSIONINFOEXW osvi = {};
+            osvi.dwOSVersionInfoSize = sizeof(osvi);
+
+#pragma warning(push)
+#pragma warning(disable : 4996)
+            if (GetVersionExW((OSVERSIONINFOW*)&osvi)) {
+                snprintf(kernel_str, sizeof(kernel_str),
+                         "Windows %lu.%lu build %lu",
+                         (unsigned long)osvi.dwMajorVersion,
+                         (unsigned long)osvi.dwMinorVersion,
+                         (unsigned long)osvi.dwBuildNumber);
+            } else {
+                snprintf(kernel_str, sizeof(kernel_str), "Windows");
+            }
+#pragma warning(pop)
+        }      
+#elif defined(__APPLE__)
+        {
+            struct utsname u; uname(&u);
+            snprintf(kernel_str, sizeof(kernel_str), "%s %s", u.sysname, u.release);
             char name[64]="", ver[32]="";
             FILE* pf;
             pf = popen("sw_vers -productName 2>/dev/null", "r");
             if (pf) { fgets(name, sizeof(name), pf); pclose(pf); }
             pf = popen("sw_vers -productVersion 2>/dev/null", "r");
             if (pf) { fgets(ver, sizeof(ver), pf); pclose(pf); }
-            name[strcspn(name,"\n")]=0;
-            ver[strcspn(ver,"\n")]=0;
+            name[strcspn(name,"\n")]=0; ver[strcspn(ver,"\n")]=0;
             if (name[0] && ver[0])
                 snprintf(distro, sizeof(distro), "%s %s", name, ver);
         }
 #else
-        // Linux: read PRETTY_NAME from /etc/os-release
-        if (FILE* f = fopen("/etc/os-release","r")) {
-            char line[256];
-            while (fgets(line, sizeof(line), f)) {
-                if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
-                    char* p = line + 12;
-                    if (*p == '"') p++;
-                    size_t len = strlen(p);
-                    while (len > 0 && (p[len-1]=='"'||p[len-1]=='\n'||p[len-1]=='\r')) p[--len]=0;
-                    snprintf(distro, sizeof(distro), "%s", p);
-                    break;
+        {
+            struct utsname u; uname(&u);
+            snprintf(kernel_str, sizeof(kernel_str), "%s %s", u.sysname, u.release);
+            if (FILE* f = fopen("/etc/os-release","r")) {
+                char line[256];
+                while (fgets(line, sizeof(line), f)) {
+                    if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
+                        char* p = line + 12;
+                        if (*p == '"') p++;
+                        size_t len = strlen(p);
+                        while (len > 0 && (p[len-1]=='"'||p[len-1]=='\n'||p[len-1]=='\r')) p[--len]=0;
+                        snprintf(distro, sizeof(distro), "%s", p);
+                        break;
+                    }
                 }
+                fclose(f);
             }
-            fclose(f);
         }
 #endif
+        InfoPanel::set(inf_os_kernel, kernel_str);
         InfoPanel::set(inf_os_distro, distro[0] ? distro : "");
     }
 
@@ -1305,8 +1457,15 @@ public:
     static void pipe_timer_cb(void* v) {
         auto* w=(MainWindow*)v;
         if (g_pipe_rd >= 0) {
-            char buf[4096]; ssize_t n;
+            char buf[4096]; int n;
+#ifdef _WIN32
+            DWORD avail = 0;
+            while (PeekNamedPipe((HANDLE)_get_osfhandle(g_pipe_rd),NULL,0,NULL,&avail,NULL) && avail > 0) {
+                n = _read(g_pipe_rd, buf, (int)std::min((DWORD)(sizeof(buf)-1), avail));
+#else
             while((n=read(g_pipe_rd,buf,sizeof(buf)-1))>0){
+#endif
+                if (n <= 0) break;
                 buf[n]='\0';
                 w->process_pipe_chunk(buf,n);
             }
@@ -1354,14 +1513,25 @@ public:
     // ── Drain remaining pipe after op ─────────────────────────────────────────
     void drain_and_stop() {
         if (g_pipe_rd >= 0) {
-            char buf[4096]; ssize_t n;
+            char buf[4096]; int n;
+#ifdef _WIN32
+            DWORD avail = 0;
+            while (PeekNamedPipe((HANDLE)_get_osfhandle(g_pipe_rd),NULL,0,NULL,&avail,NULL) && avail > 0) {
+                n = _read(g_pipe_rd, buf, (int)std::min((DWORD)(sizeof(buf)-1), avail));
+#else
             while((n=read(g_pipe_rd,buf,sizeof(buf)-1))>0){
+#endif
+                if (n <= 0) break;
                 buf[n]='\0';
                 process_pipe_chunk(buf,n);
             }
         }
         capture_stop();
+#ifdef _WIN32
+        if (g_pipe_rd >= 0) { _close(g_pipe_rd); g_pipe_rd=-1; }
+#else
         if (g_pipe_rd >= 0) { close(g_pipe_rd); g_pipe_rd=-1; }
+#endif
     }
 
     // ── File info ─────────────────────────────────────────────────────────────
@@ -1371,8 +1541,13 @@ public:
                 InfoPanel::set(b,nullptr);
             return;
         }
-        char tp[4096]; strncpy(tp,path.c_str(),sizeof(tp)-1);
-        InfoPanel::set(inf_fn, basename(tp));
+        // Extract filename -- handle both / and \ separators
+        const char* fn = path.c_str();
+        const char* sl = strrchr(fn, '/');
+        const char* bs = strrchr(fn, '\\');
+        if (bs && (!sl || bs > sl)) sl = bs;
+        if (sl) fn = sl + 1;
+        InfoPanel::set(inf_fn, fn);
         struct stat st;
         if(stat(path.c_str(),&st)!=0){
             // File doesn't exist — show name but mark rest as not found
@@ -1546,7 +1721,11 @@ public:
             capture_stop(); // closes pipe_wr, restores stdout
             // Small yield to let pipe_timer_cb drain remaining data
             // and exit on its own before we remove it
+#ifdef _WIN32
+            Sleep(100); // 100ms yield for pipe drain
+#else
             struct timespec ts={0,100000000}; nanosleep(&ts,nullptr); // 100ms
+#endif
             struct AsyncDone {
                 MainWindow* w; std::string name;
                 bool ok; int r;
@@ -1560,7 +1739,9 @@ public:
                 // Drain any remaining pipe data then close read end
                 if (g_pipe_rd >= 0) {
                     // Ensure non-blocking before drain
+#ifndef _WIN32
                     fcntl(g_pipe_rd, F_SETFL, O_NONBLOCK);
+#endif
                     char buf[4096]; ssize_t n;
                     while((n=read(g_pipe_rd,buf,sizeof(buf)-1))>0){
                         buf[n]='\0';
@@ -1604,7 +1785,7 @@ public:
         bool found=false;
         for(int i=0;i<w->inp_file->size()-1;i++)
             if(std::string(w->inp_file->text(i))==p){w->inp_file->value(i);found=true;break;}
-        if(!found){w->inp_file->insert(0,p.c_str(),0,nullptr);w->inp_file->value(0);}
+        if(!found){w->inp_file->insert(0,fltk_escape(p).c_str(),0,nullptr);w->inp_file->value(0);}
         w->cur_file=p;
         w->refresh_file_info(p);
         w->log("File: "+p);
@@ -1804,7 +1985,9 @@ public:
                 auto* vd = (VDone*)ud;
                 Fl::remove_timeout(pipe_timer_cb, vd->w);
                 if (g_pipe_rd >= 0) {
+#ifndef _WIN32
                     fcntl(g_pipe_rd, F_SETFL, O_NONBLOCK);
+#endif
                     char buf[4096]; ssize_t n;
                     while((n=read(g_pipe_rd,buf,sizeof(buf)-1))>0){
                         buf[n]='\0';
@@ -1918,7 +2101,7 @@ static void apply_theme(bool dark) {
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(_WIN32)
 static void probe_gtk() {
     void* h = dlopen("libgtk-3.so.0", RTLD_LAZY | RTLD_NOLOAD);
     if (!h) h = dlopen("libgtk-3.so.0", RTLD_LAZY);
@@ -1928,6 +2111,15 @@ static void probe_gtk() {
 #endif
 
 static bool single_instance_check() {
+#ifdef _WIN32
+    // Windows single instance via named mutex
+    HANDLE hMutex = CreateMutexA(NULL, TRUE, "Global\\DpGuiSingleInstance");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (hMutex) CloseHandle(hMutex);
+        return false;
+    }
+    return true;
+#else
     int fd = open("/tmp/dpgui.lock", O_CREAT | O_RDWR, 0666);
     if (fd < 0) return true;
     if (flock(fd, LOCK_EX | LOCK_NB) == 0)
@@ -1942,13 +2134,21 @@ static bool single_instance_check() {
         system("xdotool search --name \"DediProg\" windowactivate 2>/dev/null");
 #endif
     return false;
+#endif // not _WIN32
 }
 
 int main(int argc,char** argv){
-    if (!single_instance_check()) return 0;
+#ifdef _WIN32
+    if (HWND cw = GetConsoleWindow()) {
+        ShowWindow(cw, SW_HIDE);
+    }
+#endif    
+    if (!single_instance_check()) return 0; 
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN); // prevent crash if pipe write end closes unexpectedly
+#endif
     Fl::lock();
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(_WIN32)
     probe_gtk();
 #endif
     Fl::scheme("gtk+");
@@ -1963,19 +2163,29 @@ int main(int argc,char** argv){
         const char* ldp = getenv("LD_LIBRARY_PATH");
         std::string newldp = "/usr/lib64:/lib64";
         if (ldp && *ldp) newldp += std::string(":") + ldp;
+#ifndef _WIN32
         setenv("LD_LIBRARY_PATH", newldp.c_str(), 1);
+#endif
     }
     recent_load();
     int px=100,py=100,pw=1100,ph=680;
     prefs_load(px,py,pw,ph,g_dark_mode);
-    MainWindow* win=new MainWindow(pw,ph);
+    MainWindow* win=new MainWindow(pw,ph); 
     win->resizable(win);
     win->size_range(900,560,0,0);
     win->position(px,py);
     win->show(argc,argv);
+    #ifdef _WIN32
+        HWND hwnd = fl_xid(win);
+        HICON hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(1));
+        if (hwnd && hIcon) {
+            SendMessage(hwnd, WM_SETICON, ICON_BIG,   (LPARAM)hIcon);
+            SendMessage(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
+        }
+    #endif    
     Fl::focus(win->log_disp); // default focus on log, not buttons
     // Populate file combo with recent files
-    for(auto& r:g_recent_files) win->inp_file->add(r.c_str());
+    for(auto& r:g_recent_files) win->inp_file->add(fltk_escape(r).c_str());
     if(win->inp_file->size()>1) { win->inp_file->value(0); win->cur_file=win->inp_file->text(0); win->refresh_file_info(win->cur_file); }
     win->log("Connect your SF100/SF600 via USB, then click Detect.");
     if (g_dark_mode) {

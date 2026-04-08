@@ -77,6 +77,30 @@ FILE* openChipInfoDb(void)
 }
 #endif
 
+#ifdef _WIN32
+FILE* openChipInfoDb(void)
+{
+    FILE* fp = NULL;
+    char Path[512];
+    memset(Path, 0, sizeof(Path));
+    // Get directory of the running executable
+    if (GetModuleFileNameA(NULL, Path, sizeof(Path)) != 0) {
+        // Strip executable name to get directory
+        char* sep = strrchr(Path, '\\');
+        if (sep) *(sep + 1) = '\0';
+        strcat(Path, "ChipInfoDb.dedicfg");
+        fp = fopen(Path, "rt");
+    }
+    if (!fp) {
+        // Try current directory
+        fp = fopen("ChipInfoDb.dedicfg", "rt");
+    }
+    if (!fp)
+        fprintf(stderr, "Error: ChipInfoDb.dedicfg not found.\n");
+    return fp;
+}
+#endif
+
 long fsize(FILE* fp)
 {
     long prev = ftell(fp);

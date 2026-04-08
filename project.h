@@ -56,8 +56,8 @@ CHIP_INFO GetFirstDetectionMatch(int Index);
 CHIP_INFO GetFirstDetectionMatch(char* TypeName, int Index);
 #endif
 void SetIOMode(bool isProg, int Index);
-bool ReadFile(const char* csPath, unsigned char* buffer, unsigned long* FileSize, unsigned char PaddingByte);
-bool WriteFile(const char* csPath, unsigned char* buffer, unsigned int FileSize);
+bool DP_ReadFile(const char* csPath, unsigned char* buffer, unsigned long* FileSize, unsigned char PaddingByte);
+bool DP_WriteFile(const char* csPath, unsigned char* buffer, unsigned int FileSize);
 void InitLED(int Index);
 bool ProjectInitWithID(CHIP_INFO chipinfo, int Index); // by designated ID
 bool ProjectInit(int Index); // by designated ID
@@ -83,9 +83,24 @@ void PrepareProgramParameters(int Index);
 bool ValidateProgramParameters(int Index);
 bool IdentifyChipBeforeOperation(int Index);
 
+#ifdef _WIN32
+#include <windows.h>
+/* Sleep is already defined in windows.h as void Sleep(DWORD) -- use it directly */
+static inline int DP_Sleep_ms(unsigned int mSec) { Sleep(mSec); return 0; }
+#undef Sleep
+#define Sleep DP_Sleep_ms
+#else
+#ifdef _WIN32
+static inline int DP_Sleep_ms(unsigned int mSec)
+    { Sleep(mSec); return 0; }
+#undef Sleep
+#define Sleep DP_Sleep_ms
+#else
 static inline int Sleep(unsigned int mSec)
 {
     return usleep(mSec * 1000);
 }
+#endif
+#endif
 
 #endif //_PROJECT_H

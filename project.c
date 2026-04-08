@@ -248,7 +248,7 @@ int GetFileFormatFromExt(const char* csPath)
         return BIN;
 }
 
-bool ReadFile(const char* csPath, unsigned char* buffer, unsigned long* FileSize, unsigned char PaddingByte)
+bool DP_ReadFile(const char* csPath, unsigned char* buffer, unsigned long* FileSize, unsigned char PaddingByte)
 {
     switch (GetFileFormatFromExt(csPath)) {
     case HEX:
@@ -261,7 +261,7 @@ bool ReadFile(const char* csPath, unsigned char* buffer, unsigned long* FileSize
 }
 
 // write file
-bool WriteFile(const char* csPath, unsigned char* buffer, unsigned int FileSize)
+bool DP_WriteFile(const char* csPath, unsigned char* buffer, unsigned int FileSize)
 {
     switch (GetFileFormatFromExt(csPath)) {
     case HEX:
@@ -277,7 +277,7 @@ bool LoadFile(char* filename)
 {
     bool result = true;
     unsigned long size;
-    result &= ReadFile(filename, pBufferforLoadedFile, &size, g_ucFill);
+    result &= DP_ReadFile(filename, pBufferforLoadedFile, &size, g_ucFill);
     g_uiFileChecksum = CRC32(pBufferforLoadedFile, g_ulFileSize);
     return result;
 }

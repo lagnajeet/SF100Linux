@@ -21,6 +21,8 @@ Supports Linux and macOS with a clean, professional interface.
 ### macOS Ventura
 ![Darkmode-MacOS](https://github.com/user-attachments/assets/cbcdc68f-a1c9-4dd4-bf25-ef0622dc806d)
 
+### Dark Mode (Windows 11)
+<img width="1098" height="703" alt="Windows-DarkMode" src="https://github.com/user-attachments/assets/19e5fe6e-c705-4139-9584-447b501290c4" />
 
 ---
 
@@ -182,10 +184,14 @@ dylibbundler -od -b \
 | RHEL / Rocky Linux | 9+ | ✅ Tested |
 | macOS | Ventura 13.x | ✅ Tested |
 | macOS | Tahoe 26.x | ✅ Tested |
+| Windows | 11 | ✅ Tested |
+| Windows | 7 | ✅ Tested |
+| Windows | Vista and earlier | ❌ Not supported |
 
 **Minimum requirements:**
 - Linux: glibc 2.35+ (Ubuntu 22.04 or equivalent)
 - macOS: 13.0 (Ventura)
+- Microsoft Windows 7
 
 ---
 

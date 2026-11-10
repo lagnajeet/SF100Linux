@@ -358,6 +358,10 @@ int Check(int argc, char *argv[])
 int Sequence()
 {
     // *** the calling order in the following block must be kept as is ***
+    // Start from a clean status, as a fresh dpcmd process does. Otherwise a
+    // failed/cancelled operation leaves g_bStatus false and the next one
+    // (in a long-running GUI) fails immediately in BlankCheck() with code 7.
+    g_bStatus = true;
     bool boResult = true;
     boResult &= BlankCheck();
     if (boResult == false) {

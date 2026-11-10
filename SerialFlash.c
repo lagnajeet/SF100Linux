@@ -2332,6 +2332,10 @@ int SerialFlash_bulkPipeProgram(struct CAddressRange* AddrRange, unsigned char* 
         size_t loop = (range_temp.end - range_temp.start) / 0x1000000; 
 
         for (j = 0; j < loop; j++) {
+            // Cancel only between 16 MB blocks: stopping mid-block leaves the
+            // programmer firmware stuck in the bulk transfer until replugged.
+            if (j > 0 && m_isCanceled)
+                return false;
             if (j == (loop - 1))
                 down_range.end = AddrRange->end;
             else
@@ -2348,8 +2352,6 @@ int SerialFlash_bulkPipeProgram(struct CAddressRange* AddrRange, unsigned char* 
             for (i = 0; i < packageNum; ++i) {
                 BulkPipeWrite((unsigned char*)(itr_begin + (i << divider)), 1 << divider, USB_TIMEOUT, Index);
                 SF_PROGRESS_ADD(1 << divider);
-                if (m_isCanceled)
-                    return false;
             }
             itr_begin = itr_begin + (packageNum << divider);
         }
@@ -2359,8 +2361,6 @@ int SerialFlash_bulkPipeProgram(struct CAddressRange* AddrRange, unsigned char* 
         for (i = 0; i < packageNum; ++i) { 
             BulkPipeWrite((unsigned char*)((itr_begin + (i << divider))), 1 << divider, USB_TIMEOUT, Index);
             SF_PROGRESS_ADD(1 << divider);
-            if (m_isCanceled)
-                return false;
         }
     }
 
@@ -2673,6 +2673,10 @@ int SerialFlash_bulkPipeRead(struct CAddressRange* AddrRange, unsigned char* vDa
         loop = (range_temp.end - range_temp.start) / 0x1000000;
 
         for (j = 0; j < loop; j++) {
+            // Cancel only between 16 MB blocks: stopping mid-block leaves the
+            // programmer firmware stuck in the bulk transfer until replugged.
+            if (j > 0 && m_isCanceled)
+                return false;
             if (((g_bIsSF600[Index] == false) && (g_bIsSF700[Index] == false)&& (g_bIsSF600PG2[Index] == false)) && (strstr(Chip_Info.Class, SUPPORT_NUMONYX_N25Qxxx_Large_2Die) != NULL || strstr(Chip_Info.Class, SUPPORT_NUMONYX_N25Qxxx_Large_4Die) != NULL)) // for sf100
             {
                 unsigned char re = 0;
@@ -2707,7 +2711,7 @@ int SerialFlash_bulkPipeRead(struct CAddressRange* AddrRange, unsigned char* vDa
             FlashCommand_SendCommand_SetupPacketForBulkRead(&read_range, modeRead, ReadCom, Chip_Info.AddrWidth,Chip_Info.ReadDummyLen, Index);
             for (i = 0; i < pageNum; ++i) {
                 ret = BulkPipeRead(vData + (BufferLocation + i) * (1<<9), USB_TIMEOUT, Index); 
-                if ((ret != (1<<9)) || m_isCanceled)
+                if (ret != (1<<9))
                     return 0;
                 SF_PROGRESS_ADD(1<<9);
             }
@@ -2736,7 +2740,7 @@ int SerialFlash_bulkPipeRead(struct CAddressRange* AddrRange, unsigned char* vDa
         FlashCommand_SendCommand_SetupPacketForBulkRead(AddrRange, modeRead, ReadCom,Chip_Info.AddrWidth,Chip_Info.ReadDummyLen, Index);
         for (i = 0; i < pageNum; ++i) {
             ret = BulkPipeRead(vData + i * 512, USB_TIMEOUT, Index);
-            if ((ret != 512) || m_isCanceled) { 
+            if (ret != 512) { // single block: run to the end, cancel ignored
                 return false;
             }
             SF_PROGRESS_ADD(512);
@@ -2993,7 +2997,9 @@ void SerialFlash_SetCancelOperationFlag()
 
 void SerialFlash_ClearCancelOperationFlag()
 {
-    m_isCanceled = SerialFlash_FALSE;
+    // Must be 0, not SerialFlash_FALSE: that is -1, which every
+    // "if (m_isCanceled)" check treats as cancelled.
+    m_isCanceled = 0;
 }
 
 int SerialFlash_readSR(unsigned char* cSR, int Index)

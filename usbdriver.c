@@ -47,6 +47,8 @@ extern unsigned char GetFPGAVersion(int Index);
 void usb_dev_init(void)
 {
     int r;
+    if (ctx != NULL)   // already initialised — reuse (re-open after USB reconnect)
+        return;
     r = libusb_init(&ctx);
     if (r < 0) {
         printf("initialization failed!");
@@ -62,6 +64,7 @@ void usb_dev_init(void)
 void usb_db_init(void)
 {
     int i;
+    dev_index = 0;     // restart the count so a re-open uses slot 0 again
     for (i = 0; i < MAX_Dev_Index; i++) {
         usb_device_entry[i].valid = 0;
         dediprog_handle[i] = NULL;
@@ -558,10 +561,23 @@ int usb_driver_release(void)
             return 0;
         libusb_release_interface(dediprog_handle[i], 0);
         libusb_close(dediprog_handle[i]);
+        dediprog_handle[i] = NULL;
     }
     return 0;
 }
- 
+
+/* Returns 1 if the programmer at Index still answers on USB, 0 if it was
+ * unplugged (stale handle). Uses the standard GET_STATUS request, answered
+ * by the USB device layer itself, so it does not disturb the firmware. */
+int usb_is_alive(int Index)
+{
+    unsigned char st[2];
+    if (Index < 0 || Index >= MAX_Dev_Index || dediprog_handle[Index] == NULL)
+        return 0;
+    return libusb_control_transfer(dediprog_handle[Index],
+               LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_STANDARD | LIBUSB_RECIPIENT_DEVICE,
+               LIBUSB_REQUEST_GET_STATUS, 0, 0, st, 2, 500) == 2;
+} 
 bool Is_usbworking(int Index)
 {
     usleep(1000); // unknow reson

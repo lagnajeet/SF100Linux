@@ -59,6 +59,7 @@ typedef struct {
 int usb_driver_init(void);
 int get_usb_dev_cnt(void);
 int usb_driver_release(void);
+int usb_is_alive(int Index);
 
 int OutCtrlRequest(CNTRPIPE_RQ* rq, unsigned char* buf, unsigned long buf_size, int Index);
 

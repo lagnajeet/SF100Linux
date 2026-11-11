@@ -3,7 +3,7 @@
  *
  * Links directly against SF100Linux V1.14.21.x C sources.
  * Layout mirrors the Windows DediProg SF7 GUI:
- *   - OS Info / File Info / Programmer Info / Memory Info panels
+ *   - System Info / File Info / Programmer Info / Memory Info panels
  *   - VCC auto-detected from chip database (VoltageInMv)
  *   - Native Linux file picker (zenity → kdialog → FLTK fallback)
  *
@@ -59,12 +59,16 @@
 #include <condition_variable>
 #include <atomic>
 #include <functional>
+#include <chrono>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #ifndef _WIN32
 #include <sys/utsname.h>
+#endif
+#ifdef __APPLE__
+#include <sys/sysctl.h>  // sysctlbyname() for System Info
 #endif
 #include <libgen.h>
 #include <time.h>
@@ -431,7 +435,7 @@ static std::string show_chip_select_dialog(
 
 // Centre a dialog over the parent window before showing
 // Forward declaration (defined later with native file picker)
-static std::string native_pick(const char* title, const char* glob, bool save);
+static std::string native_pick(const char* title, const char* glob, bool save, const char* preset=nullptr);
 
 // ── Recent files ──────────────────────────────────────────────────────────────
 static const int RECENT_MAX = 10;
@@ -805,7 +809,36 @@ static bool              g_chip_selected = false;  // set true after successful 
 static int               g_marquee_tick = 0;       // drives progress bar animation (chip-erase fallback)
 
 // ── Native file picker ────────────────────────────────────────────────────────
-static std::string native_pick(const char* title, const char* glob, bool save=false) {
+// Save-dialog filter: one entry per extension in glob (first = default), then All Files.
+// "*.img *.bin" -> "IMG Files\t*.img\nBIN Files\t*.bin\nAll Files\t*\n"
+static std::string save_filter(const char* glob) {
+    std::string out;
+    char tmp[512]; strncpy(tmp, glob, sizeof(tmp)-1); tmp[sizeof(tmp)-1] = 0;
+    for (char* tok = strtok(tmp, " "); tok; tok = strtok(nullptr, " ")) {
+        const char* dot = strchr(tok, '.');
+        if (!dot || !*(dot+1)) continue;
+        std::string up = dot + 1;
+        for (auto& ch : up) ch = (char)toupper((unsigned char)ch);
+        out += up + " Files\t" + tok + "\n";
+    }
+    return out + "All Files\t*\n";
+}
+
+// Append the first extension from glob if the file name has none.
+// ensure_ext("C:/x/dump", "*.img *.bin") -> "C:/x/dump.img"
+static std::string ensure_ext(const std::string& path, const char* glob) {
+    if (path.empty()) return path;
+    size_t sl = path.find_last_of("/\\");
+    size_t dot = path.find_last_of('.');
+    if (dot != std::string::npos && (sl == std::string::npos || dot > sl)) return path;
+    const char* g = strchr(glob, '.');
+    if (!g) return path;
+    size_t n = strcspn(g, " ");
+    return path + std::string(g, n);
+}
+
+static std::string native_pick(const char* title, const char* glob, bool save=false,
+                               const char* preset) {
     char cmd[2048];
 
 #ifdef _WIN32
@@ -826,8 +859,11 @@ static std::string native_pick(const char* title, const char* glob, bool save=fa
         }
         std::string filter = "Firmware Files\t*.{" + exts + "}\n";
         fc.filter(filter.c_str());
+    } else {
+        fc.filter(save_filter(glob).c_str());
+        if (preset) fc.preset_file(preset);
     }
-    if (fc.show() == 0 && fc.filename()) 
+    if (fc.show() == 0 && fc.filename())
     {
         // printf("Selected file: %s\n", fc.filename());
         return fc.filename();
@@ -852,6 +888,9 @@ static std::string native_pick(const char* title, const char* glob, bool save=fa
         }
         std::string filter = "Firmware Files\t*.{" + exts + "}\n";
         fc.filter(filter.c_str());
+    } else {
+        fc.filter(save_filter(glob).c_str());
+        if (preset) fc.preset_file(preset);
     }
     if (fc.show() == 0 && fc.filename()) return fc.filename();
     return "";
@@ -881,6 +920,9 @@ static std::string native_pick(const char* title, const char* glob, bool save=fa
             }
             std::string filter = "Firmware Files\t*.{" + exts + "}\n";
             fc.filter(filter.c_str());
+        } else {
+            fc.filter(save_filter(glob).c_str());
+            if (preset) fc.preset_file(preset);
         }
         if (fc.show() == 0 && fc.filename()) return fc.filename();
         return "";
@@ -897,14 +939,28 @@ static std::string native_pick(const char* title, const char* glob, bool save=fa
             " 2>/dev/null",
             title, glob,
             xwin ? (std::string(" --attach=") + std::to_string(xwin)).c_str() : "");
-    else
+    else {
+        // One --file-filter per extension (first is default), then All Files
+        std::string zf;
+        char ztmp[512]; strncpy(ztmp, glob, sizeof(ztmp)-1); ztmp[sizeof(ztmp)-1] = 0;
+        for (char* t = strtok(ztmp, " "); t; t = strtok(nullptr, " ")) {
+            const char* d = strchr(t, '.');
+            if (!d || !*(d+1)) continue;
+            std::string up = d + 1;
+            for (auto& ch : up) ch = (char)toupper((unsigned char)ch);
+            zf += " --file-filter='" + up + " Files | " + t + "'";
+        }
+        zf += " --file-filter='All Files | *'";
+        if (preset) zf += std::string(" --filename='") + preset + "'";
         snprintf(cmd, sizeof(cmd),
             "zenity --file-selection --save --confirm-overwrite --modal"
             " --title='%s'"
             "%s"
+            "%s"
             " 2>/dev/null",
-            title,
+            title, zf.c_str(),
             xwin ? (std::string(" --attach=") + std::to_string(xwin)).c_str() : "");
+    }
     FILE* p = popen(cmd, "r");
     if (p) {
         char buf[4096] = {};
@@ -923,7 +979,8 @@ static std::string native_pick(const char* title, const char* glob, bool save=fa
             "kdialog --getopenfilename . '%s' --title '%s' 2>/dev/null", glob, title);
     else
         snprintf(cmd, sizeof(cmd),
-            "kdialog --getsavefilename . '*.bin' --title '%s' 2>/dev/null", title);
+            "kdialog --getsavefilename './%s' '%s' --title '%s' 2>/dev/null",
+            preset ? preset : "", glob, title);
     p = popen(cmd, "r");
     if (p) {
         char buf[4096] = {};
@@ -950,11 +1007,229 @@ static std::string native_pick(const char* title, const char* glob, bool save=fa
         }
         std::string filter = "Firmware Files\t*.{" + exts + "}\n";
         fc.filter(filter.c_str());
+    } else {
+        fc.filter(save_filter(glob).c_str());
+        if (preset) fc.preset_file(preset);
     }
     if (fc.show() == 0 && fc.filename()) return fc.filename();
     return "";
 #endif
 }
+// ── MD5 (RFC 1321, public domain reference implementation) ──────────────────
+namespace md5impl {
+    typedef uint32_t u32;
+    struct Ctx { u32 a,b,c,d; uint64_t len; uint8_t buf[64]; size_t buflen; };
+
+    static inline u32 rol(u32 x, int c){ return (x<<c)|(x>>(32-c)); }
+
+    static void transform(Ctx& ctx, const uint8_t block[64]) {
+        static const u32 K[64] = {
+            0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+            0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+            0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+            0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+            0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+            0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+            0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+            0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391 };
+        static const int S[64] = {
+            7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+            5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+            4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+            6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21 };
+        u32 M[16];
+        for (int i=0;i<16;i++)
+            M[i] = (u32)block[i*4] | ((u32)block[i*4+1]<<8) |
+                   ((u32)block[i*4+2]<<16) | ((u32)block[i*4+3]<<24);
+        u32 A=ctx.a,B=ctx.b,C=ctx.c,D=ctx.d;
+        for (int i=0;i<64;i++) {
+            u32 F; int g;
+            if      (i<16){ F=(B&C)|(~B&D);      g=i; }
+            else if (i<32){ F=(D&B)|(~D&C);      g=(5*i+1)&15; }
+            else if (i<48){ F=B^C^D;             g=(3*i+5)&15; }
+            else         { F=C^(B|~D);           g=(7*i)&15; }
+            u32 tmp=D; D=C; C=B;
+            B = B + rol(A + F + K[i] + M[g], S[i]);
+            A = tmp;
+        }
+        ctx.a+=A; ctx.b+=B; ctx.c+=C; ctx.d+=D;
+    }
+
+    static void init(Ctx& c){ c.a=0x67452301; c.b=0xefcdab89; c.c=0x98badcfe; c.d=0x10325476; c.len=0; c.buflen=0; }
+
+    static void update(Ctx& c, const uint8_t* data, size_t n){
+        c.len += n;
+        while (n) {
+            size_t take = 64 - c.buflen; if (take > n) take = n;
+            memcpy(c.buf + c.buflen, data, take);
+            c.buflen += take; data += take; n -= take;
+            if (c.buflen == 64){ transform(c, c.buf); c.buflen = 0; }
+        }
+    }
+
+    static void final(Ctx& c, uint8_t out[16]){
+        uint64_t bits = c.len * 8;
+        uint8_t pad = 0x80;
+        update(c, &pad, 1);
+        uint8_t zero = 0;
+        while (c.buflen != 56) update(c, &zero, 1);
+        uint8_t lenbytes[8];
+        for (int i=0;i<8;i++) lenbytes[i] = (uint8_t)(bits >> (8*i));
+        // update() would re-add to len; write length block manually
+        memcpy(c.buf + 56, lenbytes, 8);
+        transform(c, c.buf);
+        u32 parts[4] = {c.a,c.b,c.c,c.d};
+        for (int i=0;i<4;i++){
+            out[i*4+0]=(uint8_t)(parts[i]);
+            out[i*4+1]=(uint8_t)(parts[i]>>8);
+            out[i*4+2]=(uint8_t)(parts[i]>>16);
+            out[i*4+3]=(uint8_t)(parts[i]>>24);
+        }
+    }
+} // namespace md5impl
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+// "2.40 MB (2,516,582 bytes)"
+static std::string format_size(unsigned long long bytes) {
+    char grp[32]; snprintf(grp, sizeof(grp), "%llu", bytes);
+    std::string c; int n = (int)strlen(grp);
+    for (int i = 0; i < n; i++) { if (i > 0 && (n - i) % 3 == 0) c += ','; c += grp[i]; }
+    char out[96];
+    if      (bytes >= 1024ULL*1024*1024) snprintf(out,sizeof(out),"%.2f GB (%s bytes)",bytes/(1024.0*1024*1024),c.c_str());
+    else if (bytes >= 1024ULL*1024)      snprintf(out,sizeof(out),"%.2f MB (%s bytes)",bytes/(1024.0*1024),c.c_str());
+    else if (bytes >= 1024ULL)           snprintf(out,sizeof(out),"%.2f KB (%s bytes)",bytes/1024.0,c.c_str());
+    else                                 snprintf(out,sizeof(out),"%s bytes",c.c_str());
+    return out;
+}
+
+// Elapsed operation time, rounded to whole seconds: "42 s" or "2 min 05 s"
+static std::string format_elapsed(double s) {
+    char out[32];
+    int t = (int)(s + 0.5);
+    if (t < 60) snprintf(out, sizeof(out), "%d s", t);
+    else        snprintf(out, sizeof(out), "%d min %02d s", t / 60, t % 60);
+    return out;
+}
+
+// Pick the data format from the file extension
+static FileFormat format_from_ext(const std::string& p) {
+    size_t d = p.find_last_of('.');
+    std::string ext = (d == std::string::npos) ? "" : p.substr(d + 1);
+    for (auto& ch : ext) ch = (char)tolower((unsigned char)ch);
+    if (ext == "hex" || ext == "ihx") return FMT_HEX;
+    if (ext == "s19" || ext == "srec" || ext == "mot" || ext == "s28" || ext == "s37") return FMT_S19;
+    return FMT_BIN;
+}
+
+// Turn dropped text into a filesystem path. Linux/macOS may deliver
+// "file:///path%20with%20spaces"; Windows delivers plain paths.
+// Only the first file is used if several are dropped.
+static std::string parse_dropped_path(const std::string& raw) {
+    std::string s = raw;
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    s = s.substr(a);
+    size_t e = s.find_first_of("\r\n");
+    if (e != std::string::npos) s = s.substr(0, e);
+    if (s.compare(0, 7, "file://") == 0) {
+        s = s.substr(7);
+        auto hv = [](char ch) -> int {
+            if (ch >= '0' && ch <= '9') return ch - '0';
+            if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+            if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+            return -1;
+        };
+        std::string d;
+        for (size_t i = 0; i < s.size(); i++) {
+            if (s[i] == '%' && i + 2 < s.size() && hv(s[i+1]) >= 0 && hv(s[i+2]) >= 0) {
+                d += (char)(hv(s[i+1]) * 16 + hv(s[i+2])); i += 2;
+            } else d += s[i];
+        }
+        s = d;
+#ifdef _WIN32
+        if (s.size() >= 3 && s[0] == '/' && s[2] == ':') s = s.substr(1); // /C:/... -> C:/...
+#endif
+    }
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return (b == std::string::npos) ? "" : s.substr(0, b + 1);
+}
+
+// Remove trailing 0xFF bytes from a file. If the whole file is 0xFF,
+// the file is left untouched and new_sz is set to 0.
+static bool trim_trailing_ff(const std::string& path, long long& old_sz, long long& new_sz) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long long sz = ftell(f);
+    old_sz = new_sz = sz;
+    const long CH = 65536;
+    std::vector<uint8_t> buf(CH);
+    long long pos = sz, last = -1;
+    while (pos > 0 && last < 0) {
+        long n = (long)std::min<long long>(CH, pos);
+        pos -= n;
+        fseek(f, (long)pos, SEEK_SET);
+        if (fread(buf.data(), 1, n, f) != (size_t)n) { fclose(f); return false; }
+        for (long i = n - 1; i >= 0; i--) if (buf[i] != 0xFF) { last = pos + i; break; }
+    }
+    fclose(f);
+    if (last < 0) { new_sz = 0; return true; }   // entirely blank
+    new_sz = last + 1;
+    if (new_sz == sz) return true;               // nothing to trim
+#ifdef _WIN32
+    int fd = _open(path.c_str(), _O_RDWR | _O_BINARY);
+    if (fd < 0) return false;
+    int r = _chsize_s(fd, new_sz);
+    _close(fd);
+    return r == 0;
+#else
+    return truncate(path.c_str(), (off_t)new_sz) == 0;
+#endif
+}
+
+// Info value box that copies its text to the clipboard when clicked
+class CopyBox : public Fl_Box {
+public:
+    CopyBox(int x, int y, int w, int h, const char* l = 0) : Fl_Box(x, y, w, h, l) {}
+    bool copyable() const {
+        const char* l = label();
+        return l && *l && strcmp(l, "—") != 0 && strcmp(l, "Not found") != 0;
+    }
+    int handle(int e) override {
+        switch (e) {
+            case FL_ENTER: if (copyable()) window()->cursor(FL_CURSOR_HAND); return 1;
+            case FL_LEAVE: window()->cursor(FL_CURSOR_DEFAULT); return 1;
+            case FL_PUSH:  return 1;
+            case FL_RELEASE:
+                if (copyable() && Fl::event_inside(this)) {
+                    Fl::copy(label(), (int)strlen(label()), 1); // 1 = system clipboard
+                    do_callback();
+                }
+                return 1;
+        }
+        return Fl_Box::handle(e);
+    }
+};
+
+// Log display that accepts dropped files
+class DropLogDisplay : public Fl_Text_Display {
+public:
+    std::function<void(const std::string&)> on_drop;
+    DropLogDisplay(int x, int y, int w, int h) : Fl_Text_Display(x, y, w, h) {}
+    int handle(int e) override {
+        switch (e) {
+            case FL_DND_ENTER: case FL_DND_DRAG:
+            case FL_DND_LEAVE: case FL_DND_RELEASE:
+                return 1;                          // accept the drag
+            case FL_PASTE: {                       // the drop delivers its data here
+                std::string s(Fl::event_text(), Fl::event_length());
+                if (on_drop) on_drop(s);
+                return 1;
+            }
+        }
+        return Fl_Text_Display::handle(e);
+    }
+};
 
 // ── InfoPanel ─────────────────────────────────────────────────────────────────
 class InfoPanel : public Fl_Group {
@@ -969,17 +1244,19 @@ public:
         end();
     }
     // col/total_cols: allows two-column layout within one panel
-    Fl_Box* add_val(int row, int col, int total_cols, const char* lbl) {
+    Fl_Box* add_val(int row, int col, int total_cols, const char* lbl, bool copyable = false) {
         int cw  = (w()-PAD*2)/total_cols;
         int cx  = x()+PAD + col*cw;
         int cy  = y()+HDR_H+PAD + row*ROW_H;
         int lw  = 66;
         Fl_Box* lb=new Fl_Box(cx,cy,lw,ROW_H-2,lbl);
         lb->align(FL_ALIGN_RIGHT|FL_ALIGN_INSIDE|FL_ALIGN_CLIP); lb->labelsize(11);
-        Fl_Box* vb=new Fl_Box(cx+lw,cy,cw-lw-4,ROW_H-2,"—");
+        Fl_Box* vb = copyable ? new CopyBox(cx+lw,cy,cw-lw-4,ROW_H-2,"—")
+                              : new Fl_Box (cx+lw,cy,cw-lw-4,ROW_H-2,"—");
         vb->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE|FL_ALIGN_CLIP);
         vb->labelcolor(COL_BLUE_VAL);
         vb->labelfont(FL_HELVETICA_BOLD); vb->labelsize(11);
+        if (copyable) vb->tooltip("Click to copy");
         return vb;
     }
     static void set(Fl_Box* b, const char* s) {
@@ -987,6 +1264,245 @@ public:
         b->copy_label(s && *s ? s : "—"); b->redraw();
     }
 };
+
+// ── System info (System Info panel + Save Log header) ────────────────────────
+struct SysInfo { std::string os, kernel, cpu, arch, ram, libusb; };
+
+// Strip (R)/(TM) and collapse whitespace in a CPU brand string
+static std::string tidy_cpu(std::string s) {
+    for (const char* t : {"(R)", "(r)", "(TM)", "(tm)"}) {
+        size_t p;
+        while ((p = s.find(t)) != std::string::npos) s.erase(p, strlen(t));
+    }
+    std::string o; bool sp = false;
+    for (char c : s) {
+        if (c==' ' || c=='\t' || c=='\n' || c=='\r') { sp = !o.empty(); continue; }
+        if (sp) o += ' ';
+        sp = false; o += c;
+    }
+    return o;
+}
+
+#if !defined(_WIN32) && !defined(__APPLE__)
+// Map Linux uname() machine names to the spelling app_arch() uses
+static std::string norm_arch(const std::string& a) {
+    if (a == "aarch64" || a == "arm64") return "arm64";
+    if (a == "amd64"   || a == "x86_64") return "x86_64";
+    if (a.size() == 4 && a[0] == 'i' && a.compare(2, 2, "86") == 0) return "x86";
+    if (a.compare(0, 3, "arm") == 0) return "arm";
+    return a;
+}
+#endif
+
+// Architecture this binary was compiled for
+static const char* app_arch() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return "arm64";
+#elif defined(__x86_64__) || defined(_M_X64)
+    return "x86_64";
+#elif defined(__i386__) || defined(_M_IX86)
+    return "x86";
+#elif defined(__arm__)
+    return "arm";
+#else
+    return "unknown";
+#endif
+}
+
+static std::string format_ram(unsigned long long b) {
+    if (!b) return "";
+    double g = b / 1073741824.0;
+    char t[32]; snprintf(t, sizeof(t), g >= 10 ? "%.0f GB" : "%.1f GB", g);
+    return t;
+}
+
+#ifdef _WIN32
+static std::string reg_str(const char* key, const char* val) {
+    HKEY h; std::string r;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, key, 0, KEY_READ, &h) == ERROR_SUCCESS) {
+        char buf[256] = {}; DWORD sz = sizeof(buf) - 1, type = 0;
+        if (RegQueryValueExA(h, val, nullptr, &type, (LPBYTE)buf, &sz) == ERROR_SUCCESS
+            && type == REG_SZ) r = buf;
+        RegCloseKey(h);
+    }
+    return r;
+}
+static DWORD reg_dword(const char* key, const char* val) {
+    HKEY h; DWORD r = 0;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, key, 0, KEY_READ, &h) == ERROR_SUCCESS) {
+        DWORD sz = sizeof(r), type = 0;
+        if (RegQueryValueExA(h, val, nullptr, &type, (LPBYTE)&r, &sz) != ERROR_SUCCESS
+            || type != REG_DWORD) r = 0;
+        RegCloseKey(h);
+    }
+    return r;
+}
+#elif defined(__APPLE__)
+static std::string sysctl_str(const char* name) {
+    char b[256] = {}; size_t sz = sizeof(b) - 1;
+    if (sysctlbyname(name, b, &sz, nullptr, 0) != 0) return "";
+    return b;
+}
+static long long sysctl_num(const char* name) {
+    unsigned char b[8] = {}; size_t sz = sizeof(b);
+    if (sysctlbyname(name, b, &sz, nullptr, 0) != 0) return -1;
+    if (sz == 4) { int32_t i; memcpy(&i, b, 4); return i; }
+    if (sz == 8) { int64_t i; memcpy(&i, b, 8); return i; }
+    return -1;
+}
+#endif
+
+static SysInfo collect_sysinfo() {
+    SysInfo si;
+    std::string os_arch, emu_note;
+    unsigned long long ram = 0;
+#ifdef _WIN32
+    {
+        // RtlGetVersion reports the real version; GetVersionExW says 6.2 build 9200
+        // on Windows 10/11 unless the exe carries a compatibility manifest.
+        RTL_OSVERSIONINFOW vi = {}; vi.dwOSVersionInfoSize = sizeof(vi);
+        typedef LONG (WINAPI *RtlGetVersion_t)(PRTL_OSVERSIONINFOW);
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        RtlGetVersion_t rgv = nt ? (RtlGetVersion_t)(void*)GetProcAddress(nt, "RtlGetVersion") : nullptr;
+        bool have_ver = rgv && rgv(&vi) == 0;
+
+        const char* cv = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+        std::string name = reg_str(cv, "ProductName");          // e.g. "Windows 10 Pro"
+        if (name.empty()) name = "Windows";
+        // ProductName still says "Windows 10" on Windows 11 (build 22000+)
+        if (have_ver && vi.dwBuildNumber >= 22000 && name.compare(0, 10, "Windows 10") == 0)
+            name.replace(0, 10, "Windows 11");
+        std::string rel = reg_str(cv, "DisplayVersion");        // e.g. "24H2"
+        if (rel.empty()) rel = reg_str(cv, "ReleaseId");
+        si.os = rel.empty() ? name : name + " " + rel;
+
+        if (have_ver) {
+            char t[64];
+            DWORD ubr = reg_dword(cv, "UBR");
+            if (ubr) snprintf(t, sizeof(t), "NT %lu.%lu.%lu.%lu", (unsigned long)vi.dwMajorVersion,
+                              (unsigned long)vi.dwMinorVersion, (unsigned long)vi.dwBuildNumber,
+                              (unsigned long)ubr);
+            else     snprintf(t, sizeof(t), "NT %lu.%lu.%lu", (unsigned long)vi.dwMajorVersion,
+                              (unsigned long)vi.dwMinorVersion, (unsigned long)vi.dwBuildNumber);
+            si.kernel = t;
+        }
+
+        si.cpu = reg_str("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString");
+
+        // IsWow64Process2 gives the true machine type even for an x64 build on ARM64
+        // (GetNativeSystemInfo reports AMD64 there). Not present before Windows 10 1511.
+        typedef BOOL (WINAPI *IW2_t)(HANDLE, USHORT*, USHORT*);
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        IW2_t iw2 = k32 ? (IW2_t)(void*)GetProcAddress(k32, "IsWow64Process2") : nullptr;
+        USHORT pm = 0, nm = 0;
+        if (iw2 && iw2(GetCurrentProcess(), &pm, &nm))
+            os_arch = nm == 0xAA64 ? "arm64" : nm == 0x8664 ? "x86_64" : nm == 0x014C ? "x86" : "";
+        if (os_arch.empty()) {
+            SYSTEM_INFO ns; GetNativeSystemInfo(&ns);
+            switch (ns.wProcessorArchitecture) {
+                case 9:  os_arch = "x86_64"; break;   // PROCESSOR_ARCHITECTURE_AMD64
+                case 12: os_arch = "arm64";  break;   // PROCESSOR_ARCHITECTURE_ARM64
+                case 0:  os_arch = "x86";    break;   // PROCESSOR_ARCHITECTURE_INTEL
+                default: os_arch = "unknown";
+            }
+        }
+        emu_note = " (emulated)";
+
+        MEMORYSTATUSEX ms = {}; ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms)) ram = ms.ullTotalPhys;
+    }
+#elif defined(__APPLE__)
+    {
+        std::string ver = sysctl_str("kern.osproductversion");   // e.g. "15.1"
+        // No API gives the marketing name — map the version. Unknown (newer)
+        // versions just show the number.
+        int maj = atoi(ver.c_str()), mnr = 0;
+        if (const char* d = strchr(ver.c_str(), '.')) mnr = atoi(d + 1);
+        const char* nick = nullptr;
+        switch (maj) {
+            case 10: nick = mnr == 13 ? "High Sierra" : mnr == 14 ? "Mojave" :
+                            mnr == 15 ? "Catalina"    : mnr == 16 ? "Big Sur" : nullptr; break;
+            case 11: nick = "Big Sur";  break;
+            case 12: nick = "Monterey"; break;
+            case 13: nick = "Ventura";  break;
+            case 14: nick = "Sonoma";   break;
+            case 15: nick = "Sequoia";  break;
+            case 26: nick = "Tahoe";    break;   // version jumped 15 → 26 in 2025
+            case 27: nick = "Golden Gate"; break;
+        }
+        si.os = "macOS";
+        if (nick) si.os += std::string(" ") + nick;
+        if (!ver.empty()) si.os += " " + ver;
+        struct utsname u; uname(&u);
+        si.kernel = std::string(u.sysname) + " " + u.release;
+        si.cpu = sysctl_str("machdep.cpu.brand_string");         // "Apple M3", "Intel(R) Core(TM) …"
+        // Under Rosetta uname() says x86_64; these report the real hardware
+        bool arm_hw = sysctl_num("sysctl.proc_translated") == 1 || sysctl_num("hw.optional.arm64") == 1;
+        os_arch = arm_hw ? "arm64" : "x86_64";
+        emu_note = " (Rosetta)";
+        long long m = sysctl_num("hw.memsize");
+        if (m > 0) ram = (unsigned long long)m;
+    }
+#else
+    {
+        struct utsname u; uname(&u);
+        si.kernel = std::string(u.sysname) + " " + u.release;
+        os_arch = norm_arch(u.machine);
+        if (FILE* f = fopen("/etc/os-release", "r")) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
+                    char* p = line + 12;
+                    if (*p == '"') p++;
+                    size_t len = strlen(p);
+                    while (len > 0 && (p[len-1]=='"'||p[len-1]=='\n'||p[len-1]=='\r')) p[--len]=0;
+                    si.os = p;
+                    break;
+                }
+            }
+            fclose(f);
+        }
+        if (si.os.empty()) si.os = "Linux";
+        // x86 has "model name"; many ARM boards only have "Model" (board) or "Hardware"
+        if (FILE* f = fopen("/proc/cpuinfo", "r")) {
+            char line[512]; std::string model, hw;
+            while (fgets(line, sizeof(line), f)) {
+                char* c = strchr(line, ':');
+                if (!c) continue;
+                std::string k(line, c - line);
+                while (!k.empty() && (k.back()==' ' || k.back()=='\t')) k.pop_back();
+                if      (k == "model name" && si.cpu.empty()) si.cpu = c + 1;
+                else if (k == "Model"      && model.empty())  model  = c + 1;
+                else if (k == "Hardware"   && hw.empty())     hw     = c + 1;
+            }
+            fclose(f);
+            if (si.cpu.empty()) si.cpu = !model.empty() ? model : hw;
+        }
+        long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && psz > 0) ram = (unsigned long long)pages * (unsigned long long)psz;
+    }
+#endif
+    si.cpu = tidy_cpu(si.cpu);
+    unsigned n = std::thread::hardware_concurrency();
+    if (n) {
+        char t[32]; snprintf(t, sizeof(t), "%s(%u CPUs)", si.cpu.empty() ? "" : " ", n);
+        si.cpu += t;
+    }
+
+    std::string app = app_arch();
+    si.arch = os_arch;
+    if (!os_arch.empty() && app != os_arch) si.arch += ", app " + app + emu_note;
+
+    si.ram = format_ram(ram);
+
+    const struct libusb_version* lv = libusb_get_version();
+    if (lv) {
+        char t[48]; snprintf(t, sizeof(t), "%u.%u.%u%s", lv->major, lv->minor, lv->micro,
+                             lv->rc ? lv->rc : "");
+        si.libusb = t;
+    }
+    return si;
+}
 
 static Fl_Text_Display::Style_Table_Entry g_log_styles[6];
 // Forward declaration
@@ -998,7 +1514,7 @@ public:
     Fl_Choice*       inp_file;
     Fl_Button*       btn_browse;
     Fl_Choice*       cho_clk;
-    Fl_Check_Button* chk_erase, *chk_verify;
+    Fl_Check_Button* chk_erase, *chk_verify, *chk_trim;
     Fl_Button*       btn_detect,*btn_blank,*btn_erase,
                     *btn_prog,  *btn_verify,*btn_cancel,*btn_read;
     Fl_Button*       btn_theme;
@@ -1008,10 +1524,11 @@ public:
     Fl_Text_Buffer*  log_buf;
     Fl_Text_Buffer*  log_style_buf;
 
-    // OS Info
-    Fl_Box* inf_os_distro, *inf_os_kernel;
+    // System Info
+    Fl_Box *inf_sys_os, *inf_sys_kernel, *inf_sys_cpu, *inf_sys_arch, *inf_sys_ram, *inf_sys_usb;
+    SysInfo sysinfo;   // also written into the Save Log header
     // File Info
-    Fl_Box *inf_fn, *inf_fsz, *inf_fmod, *inf_fcrc, *inf_fck;
+    Fl_Box *inf_fn, *inf_fsz, *inf_fmod, *inf_fcrc, *inf_fck, *inf_fmd5;
     // Programmer Info
     Fl_Box *inf_ptype, *inf_pfw, *inf_pfpga, *inf_phw,
            *inf_pvcc,  *inf_pspi, *inf_pio;
@@ -1060,7 +1577,7 @@ public:
             int y = PAD;
 
             // App name
-            Fl_Box* name = new Fl_Box(PAD, y, DW-PAD*2, 28, "DediProg SF100/SF600 GUI  v1.0");
+            Fl_Box* name = new Fl_Box(PAD, y, DW-PAD*2, 28, "DediProg SF100/SF600 GUI  v1.1.0");
             name->labelfont(FL_HELVETICA_BOLD); name->labelsize(14);
             name->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE);
             y += 32;
@@ -1152,7 +1669,9 @@ public:
         cho_clk->value(0);
         chk_erase =new Fl_Check_Button(M+170,y+3,110,20,"Erase first");
         chk_verify=new Fl_Check_Button(M+284,y+3,120,20,"Verify after");
-        chk_erase->value(1); chk_verify->value(1); y+=32;
+        chk_trim  =new Fl_Check_Button(M+410,y+3,190,20,"Trim blank (FF) on read");
+        chk_trim->tooltip("After Read, remove trailing 0xFF (erased) bytes from the saved file");
+        chk_erase->value(1); chk_verify->value(1); chk_trim->value(1); y+=32;
 
         // Operation buttons — full width
         static const char* labels[]={"Detect","Blank Check","Erase","Program","Verify","Read","Cancel"};
@@ -1186,7 +1705,7 @@ public:
         progress->labelsize(10); progress->labelcolor(FL_WHITE);
         progress->labelfont(FL_HELVETICA_BOLD); y+=21;
         // Status label and Clear Log button on the same row
-        lbl_status=new Fl_Box(M,y,W-M*2-70,18,"Ready — connect programmer and click Detect");
+        lbl_status=new Fl_Box(M,y,W-M*2-140,18,"Ready — connect programmer and click Detect");
         lbl_status->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE); lbl_status->labelsize(11);
         y+=20;
 
@@ -1209,7 +1728,17 @@ public:
             w->log_buf->text("");
             w->log_style_buf->text("");
         }, this);
-        log_disp=new Fl_Text_Display(LX,y,LW,BOT);
+        // Save Log button — left of Clear Log
+        Fl_Button* btn_savelog = new Fl_Button(LX+LW-64-4-64, y-20, 64, 18, "Save Log…");
+        btn_savelog->labelsize(10);
+        btn_savelog->tooltip("Save the log to a text file");
+        btn_savelog->callback([](Fl_Widget*,void* v){ ((MainWindow*)v)->save_log(); }, this);
+        DropLogDisplay* dld = new DropLogDisplay(LX,y,LW,BOT);
+        dld->on_drop = [this](const std::string& raw){
+            std::string p = parse_dropped_path(raw);
+            if (!p.empty()) load_path(p);
+        };
+        log_disp = dld;
         log_disp->buffer(log_buf);
         log_disp->textfont(FL_COURIER); log_disp->textsize(11);
         log_disp->wrap_mode(Fl_Text_Display::WRAP_AT_BOUNDS,0);
@@ -1227,22 +1756,32 @@ public:
         // ── RIGHT COLUMN: 4 info panels stacked ──────────────────────────────
         int ry = y;
 
-        // OS Info — 2 data rows
-        int os_h = 20 + 2*19 + 8;
-        InfoPanel* pos=new InfoPanel(RX,ry,RW,os_h,"OS Info"); pos->begin();
-        inf_os_distro=pos->add_val(0,0,1,"OS:");
-        inf_os_kernel=pos->add_val(1,0,1,"Kernel:"); pos->end();
+        // System Info — 5 data rows (RAM and libusb share the last row)
+        int os_h = 20 + 5*19 + 8;
+        InfoPanel* pos=new InfoPanel(RX,ry,RW,os_h,"System Info"); pos->begin();
+        inf_sys_os    =pos->add_val(0,0,1,"OS:");
+        inf_sys_kernel=pos->add_val(1,0,1,"Kernel:");
+        inf_sys_cpu   =pos->add_val(2,0,1,"CPU:");
+        inf_sys_arch  =pos->add_val(3,0,1,"Arch:");
+        inf_sys_ram   =pos->add_val(4,0,2,"RAM:");
+        inf_sys_usb   =pos->add_val(4,1,2,"libusb:");
+        pos->end();
         ry += os_h + M;
 
-        // File Info — 5 data rows
-        int fi_h = 20 + 5*19 + 8;
+        // File Info — 6 data rows
+        int fi_h = 20 + 6*19 + 8;
         InfoPanel* pfi=new InfoPanel(RX,ry,RW,fi_h,"File Info"); pfi->begin();
-        inf_fn  =pfi->add_val(0,0,1,"Name :");
-        inf_fsz =pfi->add_val(1,0,1,"Size :");
-        inf_fmod=pfi->add_val(2,0,1,"Modified:");
-        inf_fcrc=pfi->add_val(3,0,1,"CRC32 :");
-        inf_fck =pfi->add_val(4,0,1,"Checksum:");
+        inf_fn  =pfi->add_val(0,0,1,"Name :",true);
+        inf_fsz =pfi->add_val(1,0,1,"Size :",true);
+        inf_fmod=pfi->add_val(2,0,1,"Modified:",true);
+        inf_fcrc=pfi->add_val(3,0,1,"CRC32 :",true);
+        inf_fck =pfi->add_val(4,0,1,"Checksum:",true);
+        inf_fmd5=pfi->add_val(5,0,1,"MD5 :",true);
         pfi->end();
+        for (Fl_Box* b : {inf_fn, inf_fsz, inf_fmod, inf_fcrc, inf_fck, inf_fmd5})
+            b->callback([](Fl_Widget* wd, void* v){
+                ((MainWindow*)v)->log(std::string("Copied to clipboard: ") + wd->label());
+            }, this);
         ry += fi_h + M;
 
         // Programmer Info — 4 data rows × 2 cols
@@ -1272,65 +1811,16 @@ public:
 
         end();
 
-        // Fill OS info: distro name + kernel version
-        char kernel_str[128] = "";
-        char distro[128] = "";
-#ifdef _WIN32
-        {
-            snprintf(distro, sizeof(distro), "Windows");
-
-            OSVERSIONINFOEXW osvi = {};
-            osvi.dwOSVersionInfoSize = sizeof(osvi);
-
-#pragma warning(push)
-#pragma warning(disable : 4996)
-            if (GetVersionExW((OSVERSIONINFOW*)&osvi)) {
-                snprintf(kernel_str, sizeof(kernel_str),
-                         "Windows %lu.%lu build %lu",
-                         (unsigned long)osvi.dwMajorVersion,
-                         (unsigned long)osvi.dwMinorVersion,
-                         (unsigned long)osvi.dwBuildNumber);
-            } else {
-                snprintf(kernel_str, sizeof(kernel_str), "Windows");
-            }
-#pragma warning(pop)
-        }      
-#elif defined(__APPLE__)
-        {
-            struct utsname u; uname(&u);
-            snprintf(kernel_str, sizeof(kernel_str), "%s %s", u.sysname, u.release);
-            char name[64]="", ver[32]="";
-            FILE* pf;
-            pf = popen("sw_vers -productName 2>/dev/null", "r");
-            if (pf) { fgets(name, sizeof(name), pf); pclose(pf); }
-            pf = popen("sw_vers -productVersion 2>/dev/null", "r");
-            if (pf) { fgets(ver, sizeof(ver), pf); pclose(pf); }
-            name[strcspn(name,"\n")]=0; ver[strcspn(ver,"\n")]=0;
-            if (name[0] && ver[0])
-                snprintf(distro, sizeof(distro), "%s %s", name, ver);
+        // Fill System Info (same data goes into the Save Log header)
+        sysinfo = collect_sysinfo();
+        const std::pair<Fl_Box*, const std::string*> sys_rows[] = {
+            {inf_sys_os, &sysinfo.os}, {inf_sys_kernel, &sysinfo.kernel},
+            {inf_sys_cpu, &sysinfo.cpu}, {inf_sys_arch, &sysinfo.arch},
+            {inf_sys_ram, &sysinfo.ram}, {inf_sys_usb, &sysinfo.libusb}};
+        for (const auto& r : sys_rows) {
+            InfoPanel::set(r.first, r.second->c_str());
+            if (!r.second->empty()) r.first->copy_tooltip(r.second->c_str());  // full text when clipped
         }
-#else
-        {
-            struct utsname u; uname(&u);
-            snprintf(kernel_str, sizeof(kernel_str), "%s %s", u.sysname, u.release);
-            if (FILE* f = fopen("/etc/os-release","r")) {
-                char line[256];
-                while (fgets(line, sizeof(line), f)) {
-                    if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
-                        char* p = line + 12;
-                        if (*p == '"') p++;
-                        size_t len = strlen(p);
-                        while (len > 0 && (p[len-1]=='"'||p[len-1]=='\n'||p[len-1]=='\r')) p[--len]=0;
-                        snprintf(distro, sizeof(distro), "%s", p);
-                        break;
-                    }
-                }
-                fclose(f);
-            }
-        }
-#endif
-        InfoPanel::set(inf_os_kernel, kernel_str);
-        InfoPanel::set(inf_os_distro, distro[0] ? distro : "");
     }
 
     // ── Logging ───────────────────────────────────────────────────────────────
@@ -1383,6 +1873,7 @@ public:
             btn_browse->deactivate(); inp_file->deactivate();
             cho_clk->deactivate();    chk_erase->deactivate();
             chk_verify->deactivate();
+            chk_trim->deactivate();
         } else {
             btn_detect->activate();   btn_blank->activate();
             btn_erase->activate();    btn_prog->activate();
@@ -1390,6 +1881,7 @@ public:
             btn_browse->activate();   inp_file->activate();
             cho_clk->activate();      chk_erase->activate();
             chk_verify->activate();
+            chk_trim->activate();
         }
 #ifdef __APPLE__
         // macOS FLTK 1.4: flush immediately after widget state changes so
@@ -1432,6 +1924,37 @@ public:
     //   • On \r: elapsed-time token — extract seconds, drive progress bar, discard.
     //   • On \n: real log line — trim and emit.
 
+    // ── Per-phase timing ──────────────────────────────────────────────────────
+    // The library prints "Erasing, please wait ..." ... "Erase OK" (etc.) for each
+    // phase. Time the gap and append it to the result line: "Erase OK (2.8 s)".
+    std::chrono::steady_clock::time_point phase_t0;
+    bool phase_on    = false;
+    int  phase_count = 0;      // phases timed in the current operation
+    void phase_reset() { phase_on = false; phase_count = 0; }
+    std::string phase_time(const std::string& line) {
+        static const char* starts[] = {
+            "Erasing, please wait", "Programming, please wait", "Verifying, please wait",
+            "Reading, please wait", "Checking, please wait" };
+        static const char* ends[] = {
+            "Erase OK", "Error: Erase Failed", "Program OK", "Error: Program Failed",
+            "Verify OK", "Error: Verify Failed", "Read OK", "Read Failed",
+            "The chip is blank", "The chip is NOT blank" };
+        for (const char* s : starts)
+            if (line.compare(0, strlen(s), s) == 0) {
+                phase_t0 = std::chrono::steady_clock::now(); phase_on = true;
+                return line;
+            }
+        if (phase_on)
+            for (const char* e : ends)
+                if (line.compare(0, strlen(e), e) == 0) {
+                    double s = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - phase_t0).count();
+                    phase_on = false; phase_count++;
+                    return line + " (" + format_elapsed(s) + ")";
+                }
+        return line;
+    }
+
     void process_pipe_chunk(const char* data, ssize_t len) {
         for(ssize_t i=0;i<len;i++){
             char c=data[i];
@@ -1444,7 +1967,7 @@ public:
                 if(a!=std::string::npos){
                     size_t b=g_pipe_buf.find_last_not_of(" \t\r\n");
                     std::string line=g_pipe_buf.substr(a,b-a+1);
-                    if(!line.empty()) log(line);
+                    if(!line.empty()) log(phase_time(line));
                 }
                 g_pipe_buf.clear();
             } else {
@@ -1488,6 +2011,22 @@ public:
             last_running = running;
             if (running) w->btn_cancel->activate();
             else         w->btn_cancel->deactivate();
+            if (!running && w->cancel_anim) {   // operation ended — restore Cancel
+                w->cancel_anim = false;
+                w->btn_cancel->label("Cancel");
+                w->btn_cancel->color(fl_rgb_color(140,60,10));
+                w->btn_cancel->redraw();
+            }
+        }
+
+        // "Stopping…" pulse while a cancel waits for the current 16 MB block
+        if (running && w->cancel_anim) {
+            static int ph = 0;
+            ph = (ph + 1) % 24;                                  // 24 ticks × 50 ms = 1.2 s cycle
+            float t = (ph < 12 ? ph : 24 - ph) / 12.0f;          // 0 → 1 → 0
+            w->btn_cancel->color(fl_color_average(fl_rgb_color(240,150,40),
+                                                  fl_rgb_color(140,60,10), t));
+            w->btn_cancel->redraw();
         }
 
         if (running) {
@@ -1537,7 +2076,7 @@ public:
     // ── File info ─────────────────────────────────────────────────────────────
     void refresh_file_info(const std::string& path) {
         if(path.empty()){
-            for(Fl_Box* b:{inf_fn,inf_fsz,inf_fmod,inf_fcrc,inf_fck})
+            for(Fl_Box* b:{inf_fn,inf_fsz,inf_fmod,inf_fcrc,inf_fck,inf_fmd5})
                 InfoPanel::set(b,nullptr);
             return;
         }
@@ -1555,28 +2094,107 @@ public:
             InfoPanel::set(inf_fmod, "Not found");
             InfoPanel::set(inf_fcrc, "Not found");
             InfoPanel::set(inf_fck,  "Not found");
+            InfoPanel::set(inf_fmd5, "Not found");
             return;
         }
         char tmp[128];
-        snprintf(tmp,sizeof(tmp),"0x%lX",(unsigned long)st.st_size);
-        InfoPanel::set(inf_fsz, tmp);
+        // Human-readable size + exact byte count with thousands separators
+        InfoPanel::set(inf_fsz, format_size((unsigned long long)st.st_size).c_str());
         struct tm* t=localtime(&st.st_mtime);
         strftime(tmp,sizeof(tmp),"%Y-%m-%d %H:%M",t);
         InfoPanel::set(inf_fmod, tmp);
-        // CRC32 + byte checksum
+        // CRC32 + byte checksum + MD5 — single pass over the file
         FILE* f=fopen(path.c_str(),"rb");
         if(f){
             static uint32_t tbl[256]; static bool init=false;
             if(!init){ for(int i=0;i<256;i++){uint32_t c=i;for(int j=0;j<8;j++)c=(c&1)?(0xEDB88320^(c>>1)):(c>>1);tbl[i]=c;}init=true;}
             uint32_t crc=0xFFFFFFFF,ck=0;
+            md5impl::Ctx md5; md5impl::init(md5);
             uint8_t buf[4096]; size_t n;
-            while((n=fread(buf,1,sizeof(buf),f))>0)
+            while((n=fread(buf,1,sizeof(buf),f))>0){
                 for(size_t i=0;i<n;i++){crc=tbl[(crc^buf[i])&0xFF]^(crc>>8);ck+=buf[i];}
+                md5impl::update(md5, buf, n);
+            }
             fclose(f); crc^=0xFFFFFFFF;
-            char tmp[32];
+            uint8_t dig[16]; md5impl::final(md5, dig);
+            char tmp[48];
             snprintf(tmp,sizeof(tmp),"0x%08X",crc);  InfoPanel::set(inf_fcrc,tmp);
             snprintf(tmp,sizeof(tmp),"0x%08X",ck);   InfoPanel::set(inf_fck, tmp);
+            char md5str[33];
+            for(int i=0;i<16;i++) snprintf(md5str+i*2,3,"%02X",dig[i]);
+            InfoPanel::set(inf_fmd5, md5str);
         }
+    }
+
+    // Load a file from drag-and-drop (or any path). Format defaults to Raw
+    // Binary; .hex/.ihx and .s19/.srec/.mot are recognised by extension.
+    void load_path(const std::string& p) {
+        if (g_running.load()) { log("⚠  Operation in progress — file not loaded."); return; }
+        struct stat st;
+        if (stat(p.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+            log("✗  Cannot load (not a file): " + p);
+            return;
+        }
+        g_file_format = format_from_ext(p);
+        recent_add(p);
+        bool found = false;
+        for (int i = 0; i < inp_file->size()-1; i++)
+            if (inp_file->text(i) && std::string(inp_file->text(i)) == p) { inp_file->value(i); found = true; break; }
+        if (!found) { inp_file->insert(0, fltk_escape(p).c_str(), 0, nullptr); inp_file->value(0); }
+        inp_file->redraw();   // value(0) after insert(0) doesn't redraw by itself
+        cur_file = p;
+        refresh_file_info(p);
+        log("File: " + p);
+        const char* fmtname[] = {"Auto","Raw Binary","Intel Hex","Motorola S19"};
+        log(std::string("Format: ") + fmtname[(int)g_file_format]);
+    }
+
+    // Compare file size to chip size before Program/Verify.
+    // Returns false if the user cancels.
+    bool confirm_size(const std::string& fp) {
+        if (!g_chip_selected || Chip_Info.ChipSizeInByte == 0) return true;
+        FileFormat eff = (g_file_format == FMT_AUTO) ? format_from_ext(fp) : g_file_format;
+        if (eff != FMT_BIN) return true;   // hex/s19 size on disk != image size
+        struct stat st;
+        if (stat(fp.c_str(), &st) != 0) return true;
+        unsigned long long fsz = st.st_size, csz = Chip_Info.ChipSizeInByte;
+        std::string fs = format_size(fsz), cs = format_size(csz);
+        if (fsz > csz) {
+            if (g_truncate) {
+                log("⚠  File (" + fs + ") is larger than chip (" + cs + ") — will be truncated.");
+                return true;
+            }
+            int c = fl_choice("The file is larger than the chip.\n\nFile: %s\nChip: %s\n\n"
+                              "Data past the end of the chip cannot be written.\nContinue anyway?",
+                              "Cancel", "Continue", nullptr, fs.c_str(), cs.c_str());
+            if (c != 1) { log("✗  Cancelled — file is larger than chip."); return false; }
+            log("⚠  File is larger than chip — continuing at user request.");
+        } else if (fsz < csz) {
+            log("File size " + fs + ", chip size " + cs + ".");
+        }
+        return true;
+    }
+
+    // Write the log buffer to a text file chosen by the user
+    void save_log() {
+        std::string path = ensure_ext(native_pick("Save Log As", "*.txt", true, "dpgui_log.txt"), "*.txt");
+        if (path.empty()) return;
+        FILE* f = fopen(path.c_str(), "w");   // text mode: CRLF on Windows
+        if (!f) { log("✗  Could not write log: " + path); return; }
+        char ts[64]; time_t now = time(nullptr);
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&now));
+        fprintf(f, "DediProg SF100/SF600 GUI v1.1.0 — log saved %s\n", ts);
+        auto dash = [](const std::string& s) { return s.empty() ? "—" : s.c_str(); };
+        fprintf(f, "OS:      %s\n", dash(sysinfo.os));
+        fprintf(f, "Kernel:  %s\n", dash(sysinfo.kernel));
+        fprintf(f, "CPU:     %s\n", dash(sysinfo.cpu));
+        fprintf(f, "Arch:    %s\n", dash(sysinfo.arch));
+        fprintf(f, "RAM:     %s\n", dash(sysinfo.ram));
+        fprintf(f, "libusb:  %s\n\n", dash(sysinfo.libusb));
+        char* txt = log_buf->text();
+        if (txt) { fputs(txt, f); free(txt); }
+        bool ok = (fclose(f) == 0);
+        log(ok ? "✓  Log saved: " + path : "✗  Could not write log: " + path);
     }
 
     // ── Programmer info ───────────────────────────────────────────────────────
@@ -1675,19 +2293,49 @@ public:
 
     // ── USB init ──────────────────────────────────────────────────────────────
     bool init_usb() {
-        if(g_usb_open) return true;
+        bool reconnect=false;
+        if(g_usb_open){
+            if(usb_is_alive(0)) return true;
+            // Programmer was unplugged (and maybe plugged back in): the old
+            // libusb handle is stale. Release it and open the device again.
+            log("⚠  Programmer was disconnected — reconnecting…");
+            usb_driver_release();
+            g_usb_open=false;
+            reconnect=g_chip_selected;
+            g_chip_selected=false;   // programmer lost its chip settings
+        }
         GetLogPath(g_LogPath);
         log("Initialising USB…");
         if(OpenUSB()){
             LeaveStandaloneMode(0);
             QueryBoard(0);
             g_usb_open=true;
+            prog_uid=ReadUID(0);     // remembered to check recovery after a cancel
             log("USB OK — programmer found");
             refresh_prog_info();
+            if(reconnect) log("⚠  Programmer was reconnected — chip selection cleared, click Detect first.");
         } else {
             log("USB FAILED — check connection and udev rules");
         }
         return g_usb_open;
+    }
+
+    // ── Check after Cancel ────────────────────────────────────────────────────
+    // The library now only stops Read/Program between 16 MB blocks, so the
+    // programmer should be idle after a cancel. As a safety net, check its
+    // serial number reads back correctly (it reads 0xFFFFFF while the firmware
+    // is stuck mid-transfer, e.g. after cancelling a variant that still stops
+    // mid-block). Runs on the main thread when a cancelled operation finished.
+    bool         cancel_requested = false;
+    bool         cancel_anim      = false;   // "Stopping…" pulse on the Cancel button
+    unsigned int prog_uid         = 0;
+    void recover_after_cancel() {
+        if(!cancel_requested) return;
+        cancel_requested=false;
+        if(!g_usb_open) return;
+        unsigned int uid=ReadUID(0);
+        bool ok = uid!=0 && uid!=0xFFFFFF && (prog_uid==0 || uid==prog_uid);
+        if(!ok) log("⚠  Programmer did not recover — unplug and replug it before the next operation.");
     }
 
     // ── Generic async op ──────────────────────────────────────────────────────
@@ -1695,12 +2343,17 @@ public:
                    std::function<void()> setup,
                    std::function<void(bool)> done=nullptr) {
         if(g_running.load()){fl_alert("Operation in progress.");return;}
-        if(!g_usb_open&&!init_usb()){fl_alert("Programmer not connected.");return;}
+        if(!init_usb()){fl_alert("Programmer not connected.");return;}
         if(!g_chip_selected){fl_alert("No chip selected.\nClick Detect first.");return;}
         g_running=true;
         set_ui_busy(true);
         set_status((name+"…").c_str()); set_progress(0);
         log("─── "+name+" ───");
+        phase_reset();
+        // Upstream's clear calls are compiled out (#if 0 in project.c), so a
+        // previous Cancel would otherwise make every later operation fail.
+        SerialFlash_ClearCancelOperationFlag();
+        cancel_requested=false;   // a Cancel confirmed after the last op ended
         apply_settings(); setup();
 
         g_bDisplayTimer = false;   // silence \r elapsed-time noise from library
@@ -1712,8 +2365,10 @@ public:
         Fl::add_timeout(0.05, pipe_timer_cb,    this);
         // (progress_timer_cb runs permanently from main)
 
-        std::thread([this,name,done](){
+        auto t0 = std::chrono::steady_clock::now();
+        std::thread([this,name,done,t0](){
             int r=Handler(); bool ok=(r==EXCODE_PASS);
+            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             fflush(stdout);
             // Close pipe write end first so pipe_timer_cb sees EOF
             // and stops reading. Do NOT hold Fl::lock() during drain
@@ -1730,8 +2385,9 @@ public:
                 MainWindow* w; std::string name;
                 bool ok; int r;
                 std::function<void(bool)> done;
+                double secs;
             };
-            auto* ad = new AsyncDone{this, name, ok, r, done};
+            auto* ad = new AsyncDone{this, name, ok, r, done, secs};
             Fl::awake([](void* ud){
                 // Runs on main thread -- safe for AppKit and UI ops
                 auto* ad = (AsyncDone*)ud;
@@ -1751,12 +2407,18 @@ public:
                 }
                 ad->w->set_progress(100);
                 ad->w->set_ui_busy(false);
+                std::string el = " (" + format_elapsed(ad->secs) + ")";
+                // One timed phase: its line already shows the time. Several: show the total.
+                std::string tl = ad->w->phase_count == 1 ? ""
+                               : ad->w->phase_count > 1  ? " (total " + format_elapsed(ad->secs) + ")"
+                               : el;
                 ad->w->log(ad->ok
-                    ? ("✓  "+ad->name+" OK")
-                    : ("✗  "+ad->name+" FAILED (code "+std::to_string(ad->r)+")"));
+                    ? ("✓  "+ad->name+" OK"+tl)
+                    : ("✗  "+ad->name+" FAILED (code "+std::to_string(ad->r)+")"+tl));
                 ad->w->set_status(ad->ok
-                    ? (ad->name+" OK").c_str()
-                    : (ad->name+" FAILED").c_str());
+                    ? (ad->name+" OK"+el).c_str()
+                    : (ad->name+" FAILED"+el).c_str());
+                ad->w->recover_after_cancel();   // no-op unless Cancel was used
                 ad->w->refresh_prog_info();
                 ad->w->refresh_mem_info();
                 g_running = false;
@@ -1786,6 +2448,7 @@ public:
         for(int i=0;i<w->inp_file->size()-1;i++)
             if(std::string(w->inp_file->text(i))==p){w->inp_file->value(i);found=true;break;}
         if(!found){w->inp_file->insert(0,fltk_escape(p).c_str(),0,nullptr);w->inp_file->value(0);}
+        w->inp_file->redraw();
         w->cur_file=p;
         w->refresh_file_info(p);
         w->log("File: "+p);
@@ -1847,7 +2510,7 @@ public:
     static void cb_detect(Fl_Widget*,void* v){
         auto* w=(MainWindow*)v;
         if(g_running.load()){fl_alert("Operation in progress.");return;}
-        if(!g_usb_open&&!w->init_usb()){fl_alert("Programmer not connected.");return;}
+        if(!w->init_usb()){fl_alert("Programmer not connected.");return;}
 
         std::vector<ChipEntry> all_chips = parse_chip_db();
 
@@ -1920,7 +2583,7 @@ public:
     static void cb_erase(Fl_Widget*,void* v){
         auto* w=(MainWindow*)v;
         if(g_running.load()){fl_alert("Operation in progress.");return;}
-        if(!g_usb_open&&!w->init_usb()){fl_alert("Programmer not connected.");return;}
+        if(!w->init_usb()){fl_alert("Programmer not connected.");return;}
         if(!g_chip_selected){fl_alert("No chip selected.\nClick Detect first.");return;}
         if(fl_choice("Erase the whole chip?","Cancel","Erase",nullptr)!=1)return;
         w->run_async("Erase",[](){g_ucOperation=ERASE;});
@@ -1930,6 +2593,7 @@ public:
         std::string fp=w->cur_file;
         if(fp.empty()){fl_alert("Select a firmware file first.");return;}
         if(access(fp.c_str(),R_OK)!=0){fl_alert("File not found:\n%s",fp.c_str());return;}
+        if(!g_running.load() && !w->confirm_size(fp)) return;
         bool de=w->chk_erase->value(), dv=w->chk_verify->value();
         static std::string sp; sp=fp;
         w->run_async("Program",[de,dv](){
@@ -1949,14 +2613,18 @@ public:
         if(fp.empty()){fl_alert("Select a firmware file first.");return;}
         if(access(fp.c_str(),R_OK)!=0){fl_alert("File not found:\n%s",fp.c_str());return;}
         if(g_running.load()){fl_alert("Operation in progress.");return;}
-        if(!g_usb_open&&!w->init_usb()){fl_alert("Programmer not connected.");return;}
+        if(!w->init_usb()){fl_alert("Programmer not connected.");return;}
         if(!g_chip_selected){fl_alert("No chip selected.\nClick Detect first.");return;}
+        if(!w->confirm_size(fp)) return;
 
         static std::string sp; sp=fp;
         g_running=true;
         w->set_ui_busy(true);
         w->set_status("Verify…"); w->set_progress(0);
         w->log("─── Verify ───");
+        w->phase_reset();
+        SerialFlash_ClearCancelOperationFlag();   // see run_async
+        w->cancel_requested=false;
         w->apply_settings();
 
         g_bDisplayTimer=false;
@@ -1968,7 +2636,8 @@ public:
         Fl::add_timeout(0.05, pipe_timer_cb,    w);
         // (progress_timer_cb runs permanently from main)
 
-        std::thread([w](){
+        auto t0 = std::chrono::steady_clock::now();
+        std::thread([w,t0](){
             g_uiAddr = 0;
             g_uiLen  = g_truncate ? Chip_Info.ChipSizeInByte : 0;
             load_file_with_format(sp.c_str(), g_file_format);
@@ -1976,11 +2645,12 @@ public:
             g_ucOperation = VERIFY;
 
             int r=Handler(); bool ok=(r==EXCODE_PASS);
+            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             fflush(stdout);
             capture_stop();
             struct timespec ts={0,100000000}; nanosleep(&ts,nullptr);
-            struct VDone { MainWindow* w; bool ok; int r; };
-            auto* vd = new VDone{w, ok, r};
+            struct VDone { MainWindow* w; bool ok; int r; double secs; };
+            auto* vd = new VDone{w, ok, r, secs};
             Fl::awake([](void* ud){
                 auto* vd = (VDone*)ud;
                 Fl::remove_timeout(pipe_timer_cb, vd->w);
@@ -1997,9 +2667,12 @@ public:
                 }
                 vd->w->set_progress(100);
                 vd->w->set_ui_busy(false);
-                vd->w->log(vd->ok ? "✓  Verify OK"
-                    : ("✗  Verify FAILED (code "+std::to_string(vd->r)+")"));
-                vd->w->set_status(vd->ok ? "Verify OK" : "Verify FAILED");
+                std::string el = " (" + format_elapsed(vd->secs) + ")";
+                std::string tl = vd->w->phase_count == 1 ? "" : el;   // phase line already timed
+                vd->w->log(vd->ok ? ("✓  Verify OK"+tl)
+                    : ("✗  Verify FAILED (code "+std::to_string(vd->r)+")"+tl));
+                vd->w->set_status((vd->ok ? "Verify OK"+el : "Verify FAILED"+el).c_str());
+                vd->w->recover_after_cancel();   // no-op unless Cancel was used
                 vd->w->refresh_prog_info(); vd->w->refresh_mem_info();
                 g_running=false;
                 delete vd;
@@ -2008,6 +2681,7 @@ public:
     }
     static void cb_cancel(Fl_Widget*,void* v){
         // Only reachable when btn_cancel is active (i.e. op in progress)
+        if (((MainWindow*)v)->cancel_anim) return;   // already stopping — ignore repeat clicks
         int choice = fl_choice(
             "⚠  WARNING: Cancelling mid-operation can corrupt the chip.\n\n"
             "The programmer and chip may need to be power-cycled before\n"
@@ -2015,23 +2689,64 @@ public:
             "Cancel the current operation?",
             "Keep Running", "Cancel Operation", nullptr);
         if(choice != 1) return;   // user chose Keep Running
+        if(!g_running.load()) return;   // operation finished while the dialog was open
 
         SerialFlash_SetCancelOperationFlag();
         auto* w = (MainWindow*)v;
-        w->log("⚠  Operation cancelled by user — power-cycle programmer and chip.");
+        w->cancel_requested = true;   // check the programmer when the op ends
+        // Cancel takes effect at the next 16 MB block. Meanwhile the button reads
+        // "Stopping…" and pulses (progress_timer_cb); clicks are ignored above.
+        // progress_timer_cb restores it when the operation ends.
+        w->cancel_anim = true;
+        w->btn_cancel->label("Stopping…");
+        w->btn_cancel->redraw();
+        w->log("⚠  Cancel requested — Read/Program/Verify stop at the end of the current 16 MB block.");
         w->set_status("Cancelled");
     }
     static void cb_read(Fl_Widget*,void* v){
         auto* w=(MainWindow*)v;
         if(g_running.load()){fl_alert("Operation in progress.");return;}
-        if(!g_usb_open&&!w->init_usb()){fl_alert("Programmer not connected.");return;}
+        if(!w->init_usb()){fl_alert("Programmer not connected.");return;}
         if(!g_chip_selected){fl_alert("No chip selected.\nClick Detect first.");return;}
-        std::string path=native_pick("Save Read Output As","*.bin",true);
+        // Preset name from the chip type, e.g. "W25Q128JV.img"; default extension .img
+        std::string pre = Chip_Info.TypeName[0] ? Chip_Info.TypeName : "read";
+        for (auto& ch : pre) if (strchr("/\\:*?\"<>| ", ch)) ch = '_';
+        pre += ".img";
+        const char* rglob = "*.img *.bin";
+        std::string path=ensure_ext(native_pick("Save Read Output As",rglob,true,pre.c_str()), rglob);
         if(path.empty())return;
         static std::string sp; sp=path;
+        bool trim = w->chk_trim->value() != 0;
+        // Remember whether the file existed before, so a failed Read only
+        // deletes a file it actually wrote (the library saves the buffer even
+        // when the read failed or was cancelled).
+        struct stat pre_st;
+        bool   existed   = stat(sp.c_str(), &pre_st) == 0;
+        time_t pre_mtime = existed ? pre_st.st_mtime : 0;
         w->run_async("Read",[](){
             g_ucOperation=READ_TO_FILE;
             g_parameter_read=const_cast<char*>(sp.c_str());
+        }, [w, trim, existed, pre_mtime](bool ok){
+            if (!ok) {
+                struct stat st;
+                if (stat(sp.c_str(), &st) == 0 && (!existed || st.st_mtime != pre_mtime)) {
+                    if (::remove(sp.c_str()) == 0)   // C remove(), not Fl_Group::remove()
+                        w->log("✗  Read failed — incomplete file deleted: " + sp);
+                    else
+                        w->log("⚠  Read failed — could not delete incomplete file: " + sp);
+                }
+                return;
+            }
+            if (!trim) return;
+            long long o = 0, n = 0;
+            if (!trim_trailing_ff(sp, o, n))
+                w->log("✗  Could not trim read file.");
+            else if (n == 0)
+                w->log("⚠  Chip is blank (all 0xFF) — file left untrimmed.");
+            else if (n == o)
+                w->log("No trailing blank bytes to trim.");
+            else
+                w->log("✓  Trimmed blank tail: " + format_size(o) + " → " + format_size(n));
         });
     }
 };
@@ -2188,6 +2903,7 @@ int main(int argc,char** argv){
     for(auto& r:g_recent_files) win->inp_file->add(fltk_escape(r).c_str());
     if(win->inp_file->size()>1) { win->inp_file->value(0); win->cur_file=win->inp_file->text(0); win->refresh_file_info(win->cur_file); }
     win->log("Connect your SF100/SF600 via USB, then click Detect.");
+    win->log("Tip: drag a firmware file onto this log to load it.");
     if (g_dark_mode) {
         apply_theme(true);
         win->btn_theme->copy_label("Light Mode");

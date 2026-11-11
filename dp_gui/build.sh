@@ -57,5 +57,16 @@ g++ build/sf_FlashCommand.o build/sf_IntelHexFile.o build/sf_MotorolaFile.o \
     $(pkg-config --libs libusb-1.0) \
     -lpthread -mwindows
 
+# dpcmd command-line tool: dpcmd.c again, this time keeping its main().
+# Console program (no -mwindows), no FLTK.
+echo "Building dpcmd..."
+cc -O2 -I"$SFDIR" $(pkg-config --cflags libusb-1.0) \
+    -c "$SFDIR/dpcmd.c" -o build/dpcmd_main.o
+cc build/sf_FlashCommand.o build/sf_IntelHexFile.o build/sf_MotorolaFile.o \
+    build/sf_SerialFlash.o build/sf_board.o build/sf_parse.o \
+    build/sf_project.o build/sf_usbdriver.o build/dpcmd_main.o \
+    -o dpcmd.exe \
+    $(pkg-config --libs libusb-1.0) -lpthread
+
 echo ""
-echo "  Build successful: dpgui.exe"
+echo "  Build successful: dpgui.exe, dpcmd.exe"

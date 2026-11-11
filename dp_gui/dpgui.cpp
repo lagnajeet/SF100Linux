@@ -3,7 +3,7 @@
  *
  * Links directly against SF100Linux V1.14.21.x C sources.
  * Layout mirrors the Windows DediProg SF7 GUI:
- *   - OS Info / File Info / Programmer Info / Memory Info panels
+ *   - System Info / File Info / Programmer Info / Memory Info panels
  *   - VCC auto-detected from chip database (VoltageInMv)
  *   - Native Linux file picker (zenity → kdialog → FLTK fallback)
  *
@@ -66,6 +66,9 @@
 #include <sys/time.h>
 #ifndef _WIN32
 #include <sys/utsname.h>
+#endif
+#ifdef __APPLE__
+#include <sys/sysctl.h>  // sysctlbyname() for System Info
 #endif
 #include <libgen.h>
 #include <time.h>
@@ -1262,6 +1265,245 @@ public:
     }
 };
 
+// ── System info (System Info panel + Save Log header) ────────────────────────
+struct SysInfo { std::string os, kernel, cpu, arch, ram, libusb; };
+
+// Strip (R)/(TM) and collapse whitespace in a CPU brand string
+static std::string tidy_cpu(std::string s) {
+    for (const char* t : {"(R)", "(r)", "(TM)", "(tm)"}) {
+        size_t p;
+        while ((p = s.find(t)) != std::string::npos) s.erase(p, strlen(t));
+    }
+    std::string o; bool sp = false;
+    for (char c : s) {
+        if (c==' ' || c=='\t' || c=='\n' || c=='\r') { sp = !o.empty(); continue; }
+        if (sp) o += ' ';
+        sp = false; o += c;
+    }
+    return o;
+}
+
+#if !defined(_WIN32) && !defined(__APPLE__)
+// Map Linux uname() machine names to the spelling app_arch() uses
+static std::string norm_arch(const std::string& a) {
+    if (a == "aarch64" || a == "arm64") return "arm64";
+    if (a == "amd64"   || a == "x86_64") return "x86_64";
+    if (a.size() == 4 && a[0] == 'i' && a.compare(2, 2, "86") == 0) return "x86";
+    if (a.compare(0, 3, "arm") == 0) return "arm";
+    return a;
+}
+#endif
+
+// Architecture this binary was compiled for
+static const char* app_arch() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return "arm64";
+#elif defined(__x86_64__) || defined(_M_X64)
+    return "x86_64";
+#elif defined(__i386__) || defined(_M_IX86)
+    return "x86";
+#elif defined(__arm__)
+    return "arm";
+#else
+    return "unknown";
+#endif
+}
+
+static std::string format_ram(unsigned long long b) {
+    if (!b) return "";
+    double g = b / 1073741824.0;
+    char t[32]; snprintf(t, sizeof(t), g >= 10 ? "%.0f GB" : "%.1f GB", g);
+    return t;
+}
+
+#ifdef _WIN32
+static std::string reg_str(const char* key, const char* val) {
+    HKEY h; std::string r;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, key, 0, KEY_READ, &h) == ERROR_SUCCESS) {
+        char buf[256] = {}; DWORD sz = sizeof(buf) - 1, type = 0;
+        if (RegQueryValueExA(h, val, nullptr, &type, (LPBYTE)buf, &sz) == ERROR_SUCCESS
+            && type == REG_SZ) r = buf;
+        RegCloseKey(h);
+    }
+    return r;
+}
+static DWORD reg_dword(const char* key, const char* val) {
+    HKEY h; DWORD r = 0;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, key, 0, KEY_READ, &h) == ERROR_SUCCESS) {
+        DWORD sz = sizeof(r), type = 0;
+        if (RegQueryValueExA(h, val, nullptr, &type, (LPBYTE)&r, &sz) != ERROR_SUCCESS
+            || type != REG_DWORD) r = 0;
+        RegCloseKey(h);
+    }
+    return r;
+}
+#elif defined(__APPLE__)
+static std::string sysctl_str(const char* name) {
+    char b[256] = {}; size_t sz = sizeof(b) - 1;
+    if (sysctlbyname(name, b, &sz, nullptr, 0) != 0) return "";
+    return b;
+}
+static long long sysctl_num(const char* name) {
+    unsigned char b[8] = {}; size_t sz = sizeof(b);
+    if (sysctlbyname(name, b, &sz, nullptr, 0) != 0) return -1;
+    if (sz == 4) { int32_t i; memcpy(&i, b, 4); return i; }
+    if (sz == 8) { int64_t i; memcpy(&i, b, 8); return i; }
+    return -1;
+}
+#endif
+
+static SysInfo collect_sysinfo() {
+    SysInfo si;
+    std::string os_arch, emu_note;
+    unsigned long long ram = 0;
+#ifdef _WIN32
+    {
+        // RtlGetVersion reports the real version; GetVersionExW says 6.2 build 9200
+        // on Windows 10/11 unless the exe carries a compatibility manifest.
+        RTL_OSVERSIONINFOW vi = {}; vi.dwOSVersionInfoSize = sizeof(vi);
+        typedef LONG (WINAPI *RtlGetVersion_t)(PRTL_OSVERSIONINFOW);
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        RtlGetVersion_t rgv = nt ? (RtlGetVersion_t)(void*)GetProcAddress(nt, "RtlGetVersion") : nullptr;
+        bool have_ver = rgv && rgv(&vi) == 0;
+
+        const char* cv = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+        std::string name = reg_str(cv, "ProductName");          // e.g. "Windows 10 Pro"
+        if (name.empty()) name = "Windows";
+        // ProductName still says "Windows 10" on Windows 11 (build 22000+)
+        if (have_ver && vi.dwBuildNumber >= 22000 && name.compare(0, 10, "Windows 10") == 0)
+            name.replace(0, 10, "Windows 11");
+        std::string rel = reg_str(cv, "DisplayVersion");        // e.g. "24H2"
+        if (rel.empty()) rel = reg_str(cv, "ReleaseId");
+        si.os = rel.empty() ? name : name + " " + rel;
+
+        if (have_ver) {
+            char t[64];
+            DWORD ubr = reg_dword(cv, "UBR");
+            if (ubr) snprintf(t, sizeof(t), "NT %lu.%lu.%lu.%lu", (unsigned long)vi.dwMajorVersion,
+                              (unsigned long)vi.dwMinorVersion, (unsigned long)vi.dwBuildNumber,
+                              (unsigned long)ubr);
+            else     snprintf(t, sizeof(t), "NT %lu.%lu.%lu", (unsigned long)vi.dwMajorVersion,
+                              (unsigned long)vi.dwMinorVersion, (unsigned long)vi.dwBuildNumber);
+            si.kernel = t;
+        }
+
+        si.cpu = reg_str("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString");
+
+        // IsWow64Process2 gives the true machine type even for an x64 build on ARM64
+        // (GetNativeSystemInfo reports AMD64 there). Not present before Windows 10 1511.
+        typedef BOOL (WINAPI *IW2_t)(HANDLE, USHORT*, USHORT*);
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        IW2_t iw2 = k32 ? (IW2_t)(void*)GetProcAddress(k32, "IsWow64Process2") : nullptr;
+        USHORT pm = 0, nm = 0;
+        if (iw2 && iw2(GetCurrentProcess(), &pm, &nm))
+            os_arch = nm == 0xAA64 ? "arm64" : nm == 0x8664 ? "x86_64" : nm == 0x014C ? "x86" : "";
+        if (os_arch.empty()) {
+            SYSTEM_INFO ns; GetNativeSystemInfo(&ns);
+            switch (ns.wProcessorArchitecture) {
+                case 9:  os_arch = "x86_64"; break;   // PROCESSOR_ARCHITECTURE_AMD64
+                case 12: os_arch = "arm64";  break;   // PROCESSOR_ARCHITECTURE_ARM64
+                case 0:  os_arch = "x86";    break;   // PROCESSOR_ARCHITECTURE_INTEL
+                default: os_arch = "unknown";
+            }
+        }
+        emu_note = " (emulated)";
+
+        MEMORYSTATUSEX ms = {}; ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms)) ram = ms.ullTotalPhys;
+    }
+#elif defined(__APPLE__)
+    {
+        std::string ver = sysctl_str("kern.osproductversion");   // e.g. "15.1"
+        // No API gives the marketing name — map the version. Unknown (newer)
+        // versions just show the number.
+        int maj = atoi(ver.c_str()), mnr = 0;
+        if (const char* d = strchr(ver.c_str(), '.')) mnr = atoi(d + 1);
+        const char* nick = nullptr;
+        switch (maj) {
+            case 10: nick = mnr == 13 ? "High Sierra" : mnr == 14 ? "Mojave" :
+                            mnr == 15 ? "Catalina"    : mnr == 16 ? "Big Sur" : nullptr; break;
+            case 11: nick = "Big Sur";  break;
+            case 12: nick = "Monterey"; break;
+            case 13: nick = "Ventura";  break;
+            case 14: nick = "Sonoma";   break;
+            case 15: nick = "Sequoia";  break;
+            case 26: nick = "Tahoe";    break;   // version jumped 15 → 26 in 2025
+            case 27: nick = "Golden Gate"; break;
+        }
+        si.os = "macOS";
+        if (nick) si.os += std::string(" ") + nick;
+        if (!ver.empty()) si.os += " " + ver;
+        struct utsname u; uname(&u);
+        si.kernel = std::string(u.sysname) + " " + u.release;
+        si.cpu = sysctl_str("machdep.cpu.brand_string");         // "Apple M3", "Intel(R) Core(TM) …"
+        // Under Rosetta uname() says x86_64; these report the real hardware
+        bool arm_hw = sysctl_num("sysctl.proc_translated") == 1 || sysctl_num("hw.optional.arm64") == 1;
+        os_arch = arm_hw ? "arm64" : "x86_64";
+        emu_note = " (Rosetta)";
+        long long m = sysctl_num("hw.memsize");
+        if (m > 0) ram = (unsigned long long)m;
+    }
+#else
+    {
+        struct utsname u; uname(&u);
+        si.kernel = std::string(u.sysname) + " " + u.release;
+        os_arch = norm_arch(u.machine);
+        if (FILE* f = fopen("/etc/os-release", "r")) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
+                    char* p = line + 12;
+                    if (*p == '"') p++;
+                    size_t len = strlen(p);
+                    while (len > 0 && (p[len-1]=='"'||p[len-1]=='\n'||p[len-1]=='\r')) p[--len]=0;
+                    si.os = p;
+                    break;
+                }
+            }
+            fclose(f);
+        }
+        if (si.os.empty()) si.os = "Linux";
+        // x86 has "model name"; many ARM boards only have "Model" (board) or "Hardware"
+        if (FILE* f = fopen("/proc/cpuinfo", "r")) {
+            char line[512]; std::string model, hw;
+            while (fgets(line, sizeof(line), f)) {
+                char* c = strchr(line, ':');
+                if (!c) continue;
+                std::string k(line, c - line);
+                while (!k.empty() && (k.back()==' ' || k.back()=='\t')) k.pop_back();
+                if      (k == "model name" && si.cpu.empty()) si.cpu = c + 1;
+                else if (k == "Model"      && model.empty())  model  = c + 1;
+                else if (k == "Hardware"   && hw.empty())     hw     = c + 1;
+            }
+            fclose(f);
+            if (si.cpu.empty()) si.cpu = !model.empty() ? model : hw;
+        }
+        long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && psz > 0) ram = (unsigned long long)pages * (unsigned long long)psz;
+    }
+#endif
+    si.cpu = tidy_cpu(si.cpu);
+    unsigned n = std::thread::hardware_concurrency();
+    if (n) {
+        char t[32]; snprintf(t, sizeof(t), "%s(%u CPUs)", si.cpu.empty() ? "" : " ", n);
+        si.cpu += t;
+    }
+
+    std::string app = app_arch();
+    si.arch = os_arch;
+    if (!os_arch.empty() && app != os_arch) si.arch += ", app " + app + emu_note;
+
+    si.ram = format_ram(ram);
+
+    const struct libusb_version* lv = libusb_get_version();
+    if (lv) {
+        char t[48]; snprintf(t, sizeof(t), "%u.%u.%u%s", lv->major, lv->minor, lv->micro,
+                             lv->rc ? lv->rc : "");
+        si.libusb = t;
+    }
+    return si;
+}
+
 static Fl_Text_Display::Style_Table_Entry g_log_styles[6];
 // Forward declaration
 static void apply_theme(bool dark);
@@ -1282,8 +1524,9 @@ public:
     Fl_Text_Buffer*  log_buf;
     Fl_Text_Buffer*  log_style_buf;
 
-    // OS Info
-    Fl_Box* inf_os_distro, *inf_os_kernel;
+    // System Info
+    Fl_Box *inf_sys_os, *inf_sys_kernel, *inf_sys_cpu, *inf_sys_arch, *inf_sys_ram, *inf_sys_usb;
+    SysInfo sysinfo;   // also written into the Save Log header
     // File Info
     Fl_Box *inf_fn, *inf_fsz, *inf_fmod, *inf_fcrc, *inf_fck, *inf_fmd5;
     // Programmer Info
@@ -1334,7 +1577,7 @@ public:
             int y = PAD;
 
             // App name
-            Fl_Box* name = new Fl_Box(PAD, y, DW-PAD*2, 28, "DediProg SF100/SF600 GUI  v1.0.3");
+            Fl_Box* name = new Fl_Box(PAD, y, DW-PAD*2, 28, "DediProg SF100/SF600 GUI  v1.1.0");
             name->labelfont(FL_HELVETICA_BOLD); name->labelsize(14);
             name->align(FL_ALIGN_LEFT|FL_ALIGN_INSIDE);
             y += 32;
@@ -1513,11 +1756,16 @@ public:
         // ── RIGHT COLUMN: 4 info panels stacked ──────────────────────────────
         int ry = y;
 
-        // OS Info — 2 data rows
-        int os_h = 20 + 2*19 + 8;
-        InfoPanel* pos=new InfoPanel(RX,ry,RW,os_h,"OS Info"); pos->begin();
-        inf_os_distro=pos->add_val(0,0,1,"OS:");
-        inf_os_kernel=pos->add_val(1,0,1,"Kernel:"); pos->end();
+        // System Info — 5 data rows (RAM and libusb share the last row)
+        int os_h = 20 + 5*19 + 8;
+        InfoPanel* pos=new InfoPanel(RX,ry,RW,os_h,"System Info"); pos->begin();
+        inf_sys_os    =pos->add_val(0,0,1,"OS:");
+        inf_sys_kernel=pos->add_val(1,0,1,"Kernel:");
+        inf_sys_cpu   =pos->add_val(2,0,1,"CPU:");
+        inf_sys_arch  =pos->add_val(3,0,1,"Arch:");
+        inf_sys_ram   =pos->add_val(4,0,2,"RAM:");
+        inf_sys_usb   =pos->add_val(4,1,2,"libusb:");
+        pos->end();
         ry += os_h + M;
 
         // File Info — 6 data rows
@@ -1563,65 +1811,16 @@ public:
 
         end();
 
-        // Fill OS info: distro name + kernel version
-        char kernel_str[128] = "";
-        char distro[128] = "";
-#ifdef _WIN32
-        {
-            snprintf(distro, sizeof(distro), "Windows");
-
-            OSVERSIONINFOEXW osvi = {};
-            osvi.dwOSVersionInfoSize = sizeof(osvi);
-
-#pragma warning(push)
-#pragma warning(disable : 4996)
-            if (GetVersionExW((OSVERSIONINFOW*)&osvi)) {
-                snprintf(kernel_str, sizeof(kernel_str),
-                         "Windows %lu.%lu build %lu",
-                         (unsigned long)osvi.dwMajorVersion,
-                         (unsigned long)osvi.dwMinorVersion,
-                         (unsigned long)osvi.dwBuildNumber);
-            } else {
-                snprintf(kernel_str, sizeof(kernel_str), "Windows");
-            }
-#pragma warning(pop)
-        }      
-#elif defined(__APPLE__)
-        {
-            struct utsname u; uname(&u);
-            snprintf(kernel_str, sizeof(kernel_str), "%s %s", u.sysname, u.release);
-            char name[64]="", ver[32]="";
-            FILE* pf;
-            pf = popen("sw_vers -productName 2>/dev/null", "r");
-            if (pf) { fgets(name, sizeof(name), pf); pclose(pf); }
-            pf = popen("sw_vers -productVersion 2>/dev/null", "r");
-            if (pf) { fgets(ver, sizeof(ver), pf); pclose(pf); }
-            name[strcspn(name,"\n")]=0; ver[strcspn(ver,"\n")]=0;
-            if (name[0] && ver[0])
-                snprintf(distro, sizeof(distro), "%s %s", name, ver);
+        // Fill System Info (same data goes into the Save Log header)
+        sysinfo = collect_sysinfo();
+        const std::pair<Fl_Box*, const std::string*> sys_rows[] = {
+            {inf_sys_os, &sysinfo.os}, {inf_sys_kernel, &sysinfo.kernel},
+            {inf_sys_cpu, &sysinfo.cpu}, {inf_sys_arch, &sysinfo.arch},
+            {inf_sys_ram, &sysinfo.ram}, {inf_sys_usb, &sysinfo.libusb}};
+        for (const auto& r : sys_rows) {
+            InfoPanel::set(r.first, r.second->c_str());
+            if (!r.second->empty()) r.first->copy_tooltip(r.second->c_str());  // full text when clipped
         }
-#else
-        {
-            struct utsname u; uname(&u);
-            snprintf(kernel_str, sizeof(kernel_str), "%s %s", u.sysname, u.release);
-            if (FILE* f = fopen("/etc/os-release","r")) {
-                char line[256];
-                while (fgets(line, sizeof(line), f)) {
-                    if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
-                        char* p = line + 12;
-                        if (*p == '"') p++;
-                        size_t len = strlen(p);
-                        while (len > 0 && (p[len-1]=='"'||p[len-1]=='\n'||p[len-1]=='\r')) p[--len]=0;
-                        snprintf(distro, sizeof(distro), "%s", p);
-                        break;
-                    }
-                }
-                fclose(f);
-            }
-        }
-#endif
-        InfoPanel::set(inf_os_kernel, kernel_str);
-        InfoPanel::set(inf_os_distro, distro[0] ? distro : "");
     }
 
     // ── Logging ───────────────────────────────────────────────────────────────
@@ -1984,7 +2183,14 @@ public:
         if (!f) { log("✗  Could not write log: " + path); return; }
         char ts[64]; time_t now = time(nullptr);
         strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&now));
-        fprintf(f, "DediProg SF100/SF600 GUI v1.0.3 — log saved %s\n\n", ts);
+        fprintf(f, "DediProg SF100/SF600 GUI v1.1.0 — log saved %s\n", ts);
+        auto dash = [](const std::string& s) { return s.empty() ? "—" : s.c_str(); };
+        fprintf(f, "OS:      %s\n", dash(sysinfo.os));
+        fprintf(f, "Kernel:  %s\n", dash(sysinfo.kernel));
+        fprintf(f, "CPU:     %s\n", dash(sysinfo.cpu));
+        fprintf(f, "Arch:    %s\n", dash(sysinfo.arch));
+        fprintf(f, "RAM:     %s\n", dash(sysinfo.ram));
+        fprintf(f, "libusb:  %s\n\n", dash(sysinfo.libusb));
         char* txt = log_buf->text();
         if (txt) { fputs(txt, f); free(txt); }
         bool ok = (fclose(f) == 0);

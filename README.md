@@ -12,20 +12,20 @@ Supports Linux, macOS (Intel and Apple Silicon) and Windows with a clean, profes
 
 ## Screenshots
 <h3>macOS Tahoe 26 on Apple Silicon (dark mode)</h3>
-<img width="1200" height="723" alt="Screenshot_Tahoe_M5" src="https://github.com/user-attachments/assets/473515b5-5020-4ae9-9b18-f15b66a89144" />
+<img width="1200" alt="Screenshot_Tahoe_M5" src="https://github.com/user-attachments/assets/473515b5-5020-4ae9-9b18-f15b66a89144" />
 
 
 <details>
 <summary><b>More screenshots</b> — Windows 11, Ubuntu (light mode), macOS on Intel</summary>
 
 ### Windows 11
-<img width="1200" height="723" alt="Screenshot_Win11" src="https://github.com/user-attachments/assets/3baad0d2-23f5-4d59-b14a-281115d3a4a1" />
+<img width="1200" alt="Screenshot_Win11" src="https://github.com/user-attachments/assets/3baad0d2-23f5-4d59-b14a-281115d3a4a1" />
 
 ### Ubuntu (light mode)
-<img width="1200" height="697" alt="Screenshot_Ubuntu_Light" src="https://github.com/user-attachments/assets/0d42f85c-e71e-4a68-aed3-a09c2d77f686" />
+<img width="1200" alt="Screenshot_ubuntu1" src="https://github.com/user-attachments/assets/364e7f54-2e3e-409d-abac-04bce3dbe1ba" />
 
 ### macOS on Intel
-<img width="1200" height="773" alt="Screenshot_Mac_intel" src="https://github.com/user-attachments/assets/15f41f41-3972-4c68-81bd-c684158d5f58" />
+<img width="1200" alt="Screenshot_Mac_intel" src="https://github.com/user-attachments/assets/15f41f41-3972-4c68-81bd-c684158d5f58" />
 
 </details>
 

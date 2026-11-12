@@ -153,6 +153,7 @@ Settings and recent files are stored in `%APPDATA%\dpgui\`.
 | macOS | Ventura 13.x | Intel | ✅ Tested |
 | macOS | Tahoe 26.x | Intel | ✅ Tested |
 | macOS | Tahoe 26.x | Apple Silicon | ✅ Tested |
+| Windows | 7 | x86_64 | ✅ Tested |
 | Windows | 10 | x86_64 | ✅ Tested |
 | Windows | 11 | x86_64 | ✅ Tested |
 
